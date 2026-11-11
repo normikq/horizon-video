@@ -7,3 +7,4 @@ edition = "2024"
 # The launcher points this at the Horizon source it builds the game from.
 # For standalone building, points to the fork branch with libmpv support.
 horizon-client = { git = "https://github.com/normikq/horizon", branch = "mpv-support" }
+serde = { version = "1", features = ["derive"] }

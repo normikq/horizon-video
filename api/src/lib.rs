@@ -28,6 +28,7 @@ use horizon_client::mod_api::{
     Text, WorldPrimitivesEvent, WorldSubmitEvent, serde_json,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,7 @@ const CURVE_SLICES: usize = 24;
 const DEFAULT_DIAGONAL: f32 = 4.58939;
 /// Default aspect ratio (16:9).
 const DEFAULT_ASPECT: f32 = 16.0 / 9.0;
+const DEFAULT_HEIGHT: f32 = 2.25;
 /// How far in front of the player it is put by default.
 const DEFAULT_DISTANCE: f64 = 4.0;
 
@@ -151,6 +153,8 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(video: Option<u32>, camera_pos: [f64; 3], yaw: f32) -> Self {
+        let (sin, cos) = yaw.to_radians().sin_cos();
+        let [x, y, z] = camera_pos;
         let mut screen = Self {
             video,
             camera_pos,
@@ -160,7 +164,11 @@ impl Screen {
             distance: DEFAULT_DISTANCE,
             curvature: 0.0,
             applied_native_size: None,
-            at: [0.0; 3],
+            at: [
+                x - f64::from(sin) * DEFAULT_DISTANCE,
+                y - f64::from(DEFAULT_HEIGHT) / 2.0,
+                z + f64::from(cos) * DEFAULT_DISTANCE,
+            ],
             corners: [[0.0; 3]; 4],
         };
         screen.recalculate(None);
@@ -195,13 +203,6 @@ impl Screen {
         self.applied_native_size = native_size;
         let (width, height) = self.dimensions(native_size);
         let (sin, cos) = self.yaw.to_radians().sin_cos();
-        let [x, y, z] = self.camera_pos;
-
-        self.at = [
-            x - f64::from(sin) * self.distance,
-            y - f64::from(height) / 2.0,
-            z + f64::from(cos) * self.distance,
-        ];
 
         let right = [-cos, -sin];
         let side = |sign: f32, y_val: f32| {
@@ -280,8 +281,23 @@ struct State {
     grid_snap: Option<f32>,
 }
 
+fn screens_file_path() -> PathBuf {
+    let local = PathBuf::from(SCREENS_FILE);
+    if local.exists() {
+        return local;
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let appdata_path = PathBuf::from(appdata).join("horizon").join(SCREENS_FILE);
+        if appdata_path.exists() {
+            return appdata_path;
+        }
+    }
+    local
+}
+
 fn load_saved_screens() -> HashMap<String, SavedScreen> {
-    if let Ok(content) = std::fs::read_to_string(SCREENS_FILE) {
+    let path = screens_file_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
         let content = content.trim_start_matches('\u{feff}');
         serde_json::from_str(content).unwrap_or_default()
     } else {
@@ -290,10 +306,11 @@ fn load_saved_screens() -> HashMap<String, SavedScreen> {
 }
 
 fn save_saved_screens(screens: &HashMap<String, SavedScreen>) -> Result<(), String> {
+    let path = screens_file_path();
     let json = serde_json::to_string_pretty(screens)
         .map_err(|e| format!("failed to serialize screens: {e}"))?;
-    std::fs::write(SCREENS_FILE, json)
-        .map_err(|e| format!("failed to write {SCREENS_FILE}: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -478,13 +495,13 @@ impl VideoScreen {
         let offset = 0.02;
 
         let (normal, yaw, face_name) = if min_d == d_west {
-            ([-1.0, 0.0, 0.0], 90.0, "западная стена (West)")
+            ([-1.0, 0.0, 0.0], 270.0, "западная стена (West)")
         } else if min_d == d_east {
-            ([1.0, 0.0, 0.0], 270.0, "восточная стена (East)")
+            ([1.0, 0.0, 0.0], 90.0, "восточная стена (East)")
         } else if min_d == d_north {
-            ([0.0, 0.0, -1.0], 180.0, "северная стена (North)")
+            ([0.0, 0.0, -1.0], 0.0, "северная стена (North)")
         } else if min_d == d_south {
-            ([0.0, 0.0, 1.0], 0.0, "южная стена (South)")
+            ([0.0, 0.0, 1.0], 180.0, "южная стена (South)")
         } else if min_d == d_up {
             ([0.0, 1.0, 0.0], (camera.yaw / 90.0).round() * 90.0, "пол (Floor)")
         } else {
@@ -781,6 +798,13 @@ impl Hooks for VideoScreen {
             })(),
             "curve" | "curvature" => (|| -> Result<(), String> {
                 let s = state.screen.as_mut().ok_or("no screen active")?;
+                if argument.is_empty() {
+                    host.feedback(Text::colored(
+                        format!("§a[Horizon Video] Текущее искривление экрана: §e{:.1}°{}", s.curvature, if s.curvature <= 0.1 { " (плоский)" } else { " (цилиндрический)" }),
+                        0x55FF55,
+                    ));
+                    return Ok(());
+                }
                 let degrees: f32 = argument
                     .parse()
                     .map_err(|_| "usage: /video curve <degrees> (0 to 120)")?;
@@ -856,8 +880,11 @@ impl Hooks for VideoScreen {
             "play" => (|| -> Result<(), String> {
                 if let Some((id, path)) = argument.split_once(' ') {
                     let path = path.trim().trim_matches('"');
+                    let id = id.trim();
                     if let Some(saved) = state.saved_screens.get(id).cloned() {
                         return self.open_on_screen(host, &mut state, &saved, path);
+                    } else {
+                        return Err(format!("экран '{id}' не найден. Сохраните его командой /video save {id}"));
                     }
                 }
                 if let Some(screen) = state.screen.as_mut() {
@@ -919,12 +946,33 @@ impl Hooks for VideoScreen {
                     return Err("distance must be between 1.0 and 100.0 blocks".into());
                 }
                 s.distance = dist;
+                if let Some(camera) = host.camera() {
+                    let (_, h) = s.dimensions(s.applied_native_size);
+                    let (sin, cos) = camera.yaw.to_radians().sin_cos();
+                    let [x, y, z] = camera.position;
+                    s.yaw = camera.yaw;
+                    s.camera_pos = camera.position;
+                    s.at = [
+                        x - f64::from(sin) * dist,
+                        y - f64::from(h) / 2.0,
+                        z + f64::from(cos) * dist,
+                    ];
+                }
                 let native_size = s.video.and_then(|v| host.video_state(v)).and_then(|st| st.video_size);
                 s.recalculate(native_size);
                 Ok(())
             })(),
             "aspect" => (|| -> Result<(), String> {
                 let s = state.screen.as_mut().ok_or("no screen active")?;
+                if argument.is_empty() {
+                    let native_size = s.video.and_then(|v| host.video_state(v)).and_then(|st| st.video_size);
+                    let (w, h) = s.dimensions(native_size);
+                    host.feedback(Text::colored(
+                        format!("§a[Horizon Video] Текущие пропорции: §e{} ({:.2}x{:.2} бл)", s.aspect.as_string(), w, h),
+                        0x55FF55,
+                    ));
+                    return Ok(());
+                }
                 let aspect = AspectRatio::parse(argument)
                     .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | auto | W:H>")?;
                 s.aspect = aspect;

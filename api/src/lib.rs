@@ -5,7 +5,7 @@
 //! - `/video size <diagonal>`: sets screen diagonal in blocks (0.5 to 50.0);
 //! - `/video grow [step]`: increases screen diagonal by step blocks (default 0.5);
 //! - `/video shrink [step]`: decreases screen diagonal by step blocks (default 0.5);
-//! - `/video aspect <ratio>`: sets aspect ratio (e.g. 16:9, 4:3, 21:9, 1:1, or W:H);
+//! - `/video aspect <ratio>`: sets aspect ratio (e.g. 16:9, 4:3, 21:9, 1:1, auto, or W:H);
 //! - `/video distance <blocks>`: sets screen distance in front of the player (1.0 to 100.0);
 //! - `/video reset`: resets screen dimensions and distance to default;
 //! - `/video pause`, `/video play`, `/video seek <seconds>`, `/video volume <0-100>`, `/video close`;
@@ -27,12 +27,16 @@ const DEFAULT_DISTANCE: f64 = 4.0;
 /// Aspect ratio for the screen geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AspectRatio {
+    Auto,
     Ratio(f32),
 }
 
 impl AspectRatio {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
+        if s.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
         if let Some((w, h)) = s.split_once(':') {
             let w: f32 = w.trim().parse().ok()?;
             let h: f32 = h.trim().parse().ok()?;
@@ -47,8 +51,16 @@ impl AspectRatio {
         None
     }
 
-    pub fn value(&self) -> f32 {
+    pub fn value(&self, native_size: Option<(u32, u32)>) -> f32 {
         match self {
+            Self::Auto => {
+                if let Some((w, h)) = native_size {
+                    if h > 0 {
+                        return w as f32 / h as f32;
+                    }
+                }
+                DEFAULT_ASPECT
+            }
             Self::Ratio(r) => *r,
         }
     }
@@ -62,6 +74,8 @@ pub struct Screen {
     diagonal: f32,
     aspect: AspectRatio,
     distance: f64,
+    /// The last detected video native size applied to corners.
+    applied_native_size: Option<(u32, u32)>,
     /// The middle of the screen's bottom edge, in the world.
     at: [f64; 3],
     /// The quad's corners from `at`: top left, bottom left, bottom right,
@@ -76,24 +90,26 @@ impl Screen {
             camera_pos,
             yaw,
             diagonal: DEFAULT_DIAGONAL,
-            aspect: AspectRatio::Ratio(DEFAULT_ASPECT),
+            aspect: AspectRatio::Auto,
             distance: DEFAULT_DISTANCE,
+            applied_native_size: None,
             at: [0.0; 3],
             corners: [[0.0; 3]; 4],
         };
-        screen.recalculate();
+        screen.recalculate(None);
         screen
     }
 
-    pub fn dimensions(&self) -> (f32, f32) {
-        let r = self.aspect.value();
+    pub fn dimensions(&self, native_size: Option<(u32, u32)>) -> (f32, f32) {
+        let r = self.aspect.value(native_size);
         let height = self.diagonal / (r * r + 1.0).sqrt();
         let width = r * height;
         (width, height)
     }
 
-    pub fn recalculate(&mut self) {
-        let (width, height) = self.dimensions();
+    pub fn recalculate(&mut self, native_size: Option<(u32, u32)>) {
+        self.applied_native_size = native_size;
+        let (width, height) = self.dimensions(native_size);
         let (sin, cos) = self.yaw.to_radians().sin_cos();
         let [x, y, z] = self.camera_pos;
 
@@ -151,8 +167,13 @@ impl VideoScreen {
     }
 
     fn info(host: &dyn Host, screen: &Screen) -> String {
-        let (w, h) = screen.dimensions();
-        let size_str = format!("{:.2}x{:.2} blocks (diag {:.2})", w, h, screen.diagonal);
+        let native_size = host.video_state(screen.video).and_then(|s| s.video_size);
+        let (w, h) = screen.dimensions(native_size);
+        let aspect_mode = match screen.aspect {
+            AspectRatio::Auto => format!("auto ({:.2})", screen.aspect.value(native_size)),
+            AspectRatio::Ratio(r) => format!("{:.2}", r),
+        };
+        let size_str = format!("{:.2}x{:.2} blocks (diag {:.2}, aspect {})", w, h, screen.diagonal, aspect_mode);
         match host.video_state(screen.video) {
             Some(s) => format!(
                 "video: {:.1}/{:.1} s, size {}, dist {:.1} blk, {}{}{} frames; render {} us, game thread {} us taking + {} us staging",
@@ -200,7 +221,8 @@ impl Hooks for VideoScreen {
                     return Err("diagonal must be between 0.5 and 50.0 blocks".into());
                 }
                 s.diagonal = diag;
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("grow", Some(s)) => {
@@ -212,7 +234,8 @@ impl Hooks for VideoScreen {
                         .map_err(|_| "usage: /video grow [step in blocks]".to_string())?
                 };
                 s.diagonal = (s.diagonal + step).clamp(0.5, 50.0);
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("shrink", Some(s)) => {
@@ -224,7 +247,8 @@ impl Hooks for VideoScreen {
                         .map_err(|_| "usage: /video shrink [step in blocks]".to_string())?
                 };
                 s.diagonal = (s.diagonal - step).clamp(0.5, 50.0);
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("distance", Some(s)) => {
@@ -235,21 +259,24 @@ impl Hooks for VideoScreen {
                     return Err("distance must be between 1.0 and 100.0 blocks".into());
                 }
                 s.distance = dist;
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("aspect", Some(s)) => {
                 let aspect = AspectRatio::parse(argument)
-                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>".to_string())?;
+                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | auto | W:H>".to_string())?;
                 s.aspect = aspect;
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("reset", Some(s)) => {
                 s.diagonal = DEFAULT_DIAGONAL;
-                s.aspect = AspectRatio::Ratio(DEFAULT_ASPECT);
+                s.aspect = AspectRatio::Auto;
                 s.distance = DEFAULT_DISTANCE;
-                s.recalculate();
+                let native_size = host.video_state(s.video).and_then(|st| st.video_size);
+                s.recalculate(native_size);
                 Ok(())
             }
             ("pause", Some(s)) => host.video_pause(s.video, true).then_some(()).ok_or("failed".into()),
@@ -279,7 +306,8 @@ impl Hooks for VideoScreen {
         match (&done, &state.screen) {
             (Ok(()), Some(screen)) => match verb {
                 "size" | "grow" | "shrink" | "aspect" => {
-                    let (w, h) = screen.dimensions();
+                    let native_size = host.video_state(screen.video).and_then(|st| st.video_size);
+                    let (w, h) = screen.dimensions(native_size);
                     host.log(
                         "info",
                         &format!(
@@ -297,7 +325,7 @@ impl Hooks for VideoScreen {
                 "reset" => {
                     host.log(
                         "info",
-                        "video: screen reset to default size (4.0x2.25) and distance (4.0)",
+                        "video: screen reset to default size and distance",
                     );
                 }
                 "info" => host.log("info", &Self::info(host, screen)),
@@ -318,6 +346,27 @@ impl Hooks for VideoScreen {
                 Err(why) => host.log("warn", &format!("video: {why}")),
             }
         }
+
+        // Automatic aspect ratio detection from video stream metadata
+        if let Some(screen) = state.screen.as_mut() {
+            if screen.aspect == AspectRatio::Auto {
+                if let Some(native_size) = host.video_state(screen.video).and_then(|s| s.video_size) {
+                    if Some(native_size) != screen.applied_native_size {
+                        screen.recalculate(Some(native_size));
+                        let (w, h) = screen.dimensions(Some(native_size));
+                        let (nw, nh) = native_size;
+                        host.log(
+                            "info",
+                            &format!(
+                                "video: auto-detected video stream resolution {}x{} -> screen adjusted to {:.2}x{:.2} blocks",
+                                nw, nh, w, h
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         let due = state
             .reported
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(5));

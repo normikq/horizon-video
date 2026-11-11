@@ -192,59 +192,59 @@ impl Hooks for VideoScreen {
         let done = match (verb, state.screen.as_mut()) {
             ("open", _) => self.open(host, &mut state, argument),
             (_, None) => Err("no video is open: /video open <file>".into()),
-            ("size", Some(s)) => {
+            ("size", Some(s)) => (|| -> Result<(), String> {
                 let diag: f32 = argument
                     .parse()
-                    .map_err(|_| "usage: /video size <diagonal in blocks> (e.g. 5.0)".to_string())?;
+                    .map_err(|_| "usage: /video size <diagonal in blocks> (e.g. 5.0)")?;
                 if !(0.5..=50.0).contains(&diag) {
                     return Err("diagonal must be between 0.5 and 50.0 blocks".into());
                 }
                 s.diagonal = diag;
                 s.recalculate();
                 Ok(())
-            }
-            ("grow", Some(s)) => {
+            })(),
+            ("grow", Some(s)) => (|| -> Result<(), String> {
                 let step: f32 = if argument.is_empty() {
                     0.5
                 } else {
                     argument
                         .parse()
-                        .map_err(|_| "usage: /video grow [step in blocks]".to_string())?
+                        .map_err(|_| "usage: /video grow [step in blocks]")?
                 };
                 s.diagonal = (s.diagonal + step).clamp(0.5, 50.0);
                 s.recalculate();
                 Ok(())
-            }
-            ("shrink", Some(s)) => {
+            })(),
+            ("shrink", Some(s)) => (|| -> Result<(), String> {
                 let step: f32 = if argument.is_empty() {
                     0.5
                 } else {
                     argument
                         .parse()
-                        .map_err(|_| "usage: /video shrink [step in blocks]".to_string())?
+                        .map_err(|_| "usage: /video shrink [step in blocks]")?
                 };
                 s.diagonal = (s.diagonal - step).clamp(0.5, 50.0);
                 s.recalculate();
                 Ok(())
-            }
-            ("distance", Some(s)) => {
+            })(),
+            ("distance", Some(s)) => (|| -> Result<(), String> {
                 let dist: f64 = argument
                     .parse()
-                    .map_err(|_| "usage: /video distance <blocks> (e.g. 5.0)".to_string())?;
+                    .map_err(|_| "usage: /video distance <blocks> (e.g. 5.0)")?;
                 if !(1.0..=100.0).contains(&dist) {
                     return Err("distance must be between 1.0 and 100.0 blocks".into());
                 }
                 s.distance = dist;
                 s.recalculate();
                 Ok(())
-            }
-            ("aspect", Some(s)) => {
+            })(),
+            ("aspect", Some(s)) => (|| -> Result<(), String> {
                 let aspect = AspectRatio::parse(argument)
-                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>".to_string())?;
+                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>")?;
                 s.aspect = aspect;
                 s.recalculate();
                 Ok(())
-            }
+            })(),
             ("reset", Some(s)) => {
                 s.diagonal = DEFAULT_DIAGONAL;
                 s.aspect = AspectRatio::Ratio(DEFAULT_ASPECT);

@@ -1130,10 +1130,7 @@ impl Hooks for VideoScreen {
     fn world_primitives(&self, host: &dyn Host, event: &mut WorldPrimitivesEvent<'_>) {
         let state = self.0.lock().unwrap();
         let Some(screen) = &state.screen else { return };
-        let editing = state.editing.is_some() || (state.chat_open && state.screen.is_some());
-        if !editing {
-            return;
-        }
+        let Some(editing) = &state.editing else { return };
 
         let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
         let (w, h) = screen.dimensions(native_size);
@@ -1263,7 +1260,7 @@ impl Hooks for VideoScreen {
         }
 
         let label_pos = point_at(0.0, hh + 0.35, 0.0);
-        let id_str = state.editing.as_ref().map(|e| e.id.as_str()).unwrap_or("screen");
+        let id_str = &editing.id;
         let aspect_str = screen.aspect.as_string();
         let curve_label = if screen.curvature > 0.5 { format!(" | изгиб {:.0}°", screen.curvature) } else { "".into() };
         event.primitives.push(PrimitiveShape::Text {

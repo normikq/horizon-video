@@ -187,24 +187,24 @@ impl Hooks for VideoScreen {
         let done = match (verb, state.screen.as_mut()) {
             ("open", _) => self.open(host, &mut state, argument),
             (_, None) => Err("no video is open: /video open <file>".into()),
-            ("size", Some(s)) => {
+            ("size", Some(s)) => (|| -> Result<(), String> {
                 let diag: f32 = argument
                     .parse()
-                    .map_err(|_| "usage: /video size <diagonal in blocks> (e.g. 5.0)".to_string())?;
+                    .map_err(|_| "usage: /video size <diagonal in blocks> (e.g. 5.0)")?;
                 if !(0.5..=50.0).contains(&diag) {
                     return Err("diagonal must be between 0.5 and 50.0 blocks".into());
                 }
                 s.diagonal = diag;
                 s.recalculate();
                 Ok(())
-            }
-            ("aspect", Some(s)) => {
+            })(),
+            ("aspect", Some(s)) => (|| -> Result<(), String> {
                 let aspect = AspectRatio::parse(argument)
-                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>".to_string())?;
+                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>")?;
                 s.aspect = aspect;
                 s.recalculate();
                 Ok(())
-            }
+            })(),
             ("pause", Some(s)) => host.video_pause(s.video, true).then_some(()).ok_or("failed".into()),
             ("play", Some(s)) => host.video_pause(s.video, false).then_some(()).ok_or("failed".into()),
             ("seek", Some(s)) => argument
@@ -230,7 +230,20 @@ impl Hooks for VideoScreen {
         };
 
         match (&done, &state.screen) {
-            (Ok(()), Some(screen)) => host.log("info", &Self::info(host, screen)),
+            (Ok(()), Some(screen)) => match verb {
+                "size" | "aspect" => {
+                    let (w, h) = screen.dimensions();
+                    host.log(
+                        "info",
+                        &format!(
+                            "video: resized to {:.2}x{:.2} blocks (diagonal {:.2})",
+                            w, h, screen.diagonal
+                        ),
+                    );
+                }
+                "info" => host.log("info", &Self::info(host, screen)),
+                _ => {}
+            },
             (Ok(()), None) => host.log("info", "video: closed"),
             (Err(why), _) => host.log("warn", &format!("video: {why}")),
         }

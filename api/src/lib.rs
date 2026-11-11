@@ -1,9 +1,11 @@
 //! Horizon Video Screen: in-world video playback via libmpv.
 //!
 //! Provides the `/video` command:
-//! - `/video open <path>`: spawns a 16:9 screen in front of the player and plays the file;
+//! - `/video open <path>`: spawns a screen in front of the player and plays the file;
+//! - `/video size <diagonal>`: sets screen diagonal in blocks (0.5 to 50.0);
+//! - `/video aspect <ratio>`: sets aspect ratio (e.g. 16:9, 4:3, 21:9, 1:1, or W:H);
 //! - `/video pause`, `/video play`, `/video seek <seconds>`, `/video volume <0-100>`, `/video close`;
-//! - `/video info`: playback position and frame timing statistics.
+//! - `/video info`: playback position, screen dimensions, and frame timing statistics.
 
 use horizon_client::mod_api::{
     CommandEvent, CommandsEvent, Flow, FrameEvent, Hooks, Host, WorldSubmitEvent,
@@ -11,19 +13,108 @@ use horizon_client::mod_api::{
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The screen's size in blocks: 16:9.
-const WIDTH: f32 = 4.0;
-const HEIGHT: f32 = 2.25;
-/// How far in front of the player it is put.
-const DISTANCE: f64 = 4.0;
+/// The default screen diagonal in blocks (~4.589 blocks corresponds to 4.0 x 2.25 at 16:9).
+const DEFAULT_DIAGONAL: f32 = 4.58939;
+/// Default aspect ratio (16:9).
+const DEFAULT_ASPECT: f32 = 16.0 / 9.0;
+/// How far in front of the player it is put by default.
+const DEFAULT_DISTANCE: f64 = 4.0;
 
-struct Screen {
+/// Aspect ratio for the screen geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AspectRatio {
+    Ratio(f32),
+}
+
+impl AspectRatio {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some((w, h)) = s.split_once(':') {
+            let w: f32 = w.trim().parse().ok()?;
+            let h: f32 = h.trim().parse().ok()?;
+            if w > 0.0 && h > 0.0 {
+                return Some(Self::Ratio(w / h));
+            }
+        } else if let Ok(val) = s.parse::<f32>() {
+            if val > 0.0 {
+                return Some(Self::Ratio(val));
+            }
+        }
+        None
+    }
+
+    pub fn value(&self) -> f32 {
+        match self {
+            Self::Ratio(r) => *r,
+        }
+    }
+}
+
+pub struct Screen {
     video: u32,
+    /// Player camera position when placed or updated.
+    camera_pos: [f64; 3],
+    yaw: f32,
+    diagonal: f32,
+    aspect: AspectRatio,
+    distance: f64,
     /// The middle of the screen's bottom edge, in the world.
     at: [f64; 3],
     /// The quad's corners from `at`: top left, bottom left, bottom right,
     /// top right as the player who opened it sees them.
     corners: [[f32; 3]; 4],
+}
+
+impl Screen {
+    pub fn new(video: u32, camera_pos: [f64; 3], yaw: f32) -> Self {
+        let mut screen = Self {
+            video,
+            camera_pos,
+            yaw,
+            diagonal: DEFAULT_DIAGONAL,
+            aspect: AspectRatio::Ratio(DEFAULT_ASPECT),
+            distance: DEFAULT_DISTANCE,
+            at: [0.0; 3],
+            corners: [[0.0; 3]; 4],
+        };
+        screen.recalculate();
+        screen
+    }
+
+    pub fn dimensions(&self) -> (f32, f32) {
+        let r = self.aspect.value();
+        let height = self.diagonal / (r * r + 1.0).sqrt();
+        let width = r * height;
+        (width, height)
+    }
+
+    pub fn recalculate(&mut self) {
+        let (width, height) = self.dimensions();
+        let (sin, cos) = self.yaw.to_radians().sin_cos();
+        let [x, y, z] = self.camera_pos;
+
+        self.at = [
+            x - f64::from(sin) * self.distance,
+            y - f64::from(height) / 2.0,
+            z + f64::from(cos) * self.distance,
+        ];
+
+        let right = [-cos, -sin];
+        let side = |sign: f32, y_val: f32| {
+            [
+                right[0] * sign * width / 2.0,
+                y_val,
+                right[1] * sign * width / 2.0,
+            ]
+        };
+
+        self.corners = [
+            side(-1.0, height),
+            side(-1.0, 0.0),
+            side(1.0, 0.0),
+            side(1.0, height),
+        ];
+    }
 }
 
 #[derive(Default)]
@@ -44,27 +135,6 @@ impl Default for VideoScreen {
     }
 }
 
-/// The screen's corners for a player looking along `yaw` (degrees, 0 is
-/// south): upright, facing back at the player.
-fn corners(yaw: f32) -> [[f32; 3]; 4] {
-    let (sin, cos) = yaw.to_radians().sin_cos();
-    // The player's right-hand side: west when looking south.
-    let right = [-cos, -sin];
-    let side = |sign: f32, y: f32| {
-        [
-            right[0] * sign * WIDTH / 2.0,
-            y,
-            right[1] * sign * WIDTH / 2.0,
-        ]
-    };
-    [
-        side(-1.0, HEIGHT),
-        side(-1.0, 0.0),
-        side(1.0, 0.0),
-        side(1.0, HEIGHT),
-    ]
-}
-
 impl VideoScreen {
     fn open(&self, host: &mut dyn Host, state: &mut State, path: &str) -> Result<(), String> {
         let camera = host.camera().ok_or("no world is shown yet")?;
@@ -72,26 +142,19 @@ impl VideoScreen {
         if let Some(old) = state.screen.take() {
             host.video_close(old.video);
         }
-        let (sin, cos) = camera.yaw.to_radians().sin_cos();
-        let [x, y, z] = camera.position;
-        state.screen = Some(Screen {
-            video,
-            at: [
-                x - f64::from(sin) * DISTANCE,
-                y - f64::from(HEIGHT) / 2.0,
-                z + f64::from(cos) * DISTANCE,
-            ],
-            corners: corners(camera.yaw),
-        });
+        state.screen = Some(Screen::new(video, camera.position, camera.yaw));
         Ok(())
     }
 
     fn info(host: &dyn Host, screen: &Screen) -> String {
+        let (w, h) = screen.dimensions();
+        let size_str = format!("{:.2}x{:.2} blocks (diag {:.2})", w, h, screen.diagonal);
         match host.video_state(screen.video) {
             Some(s) => format!(
-                "video: {:.1}/{:.1} s, {}{}{} frames; render {} us, game thread {} us taking + {} us staging",
+                "video: {:.1}/{:.1} s, size {}, {}{}{} frames; render {} us, game thread {} us taking + {} us staging",
                 s.position.unwrap_or(0.0),
                 s.duration.unwrap_or(0.0),
+                size_str,
                 if s.paused { "paused, " } else { "" },
                 if s.failed { "FAILED, " } else { "" },
                 s.frames,
@@ -120,32 +183,52 @@ impl Hooks for VideoScreen {
         let (verb, argument) = rest.split_once(' ').unwrap_or((rest, ""));
         let argument = argument.trim().trim_matches('"');
         let mut state = self.0.lock().unwrap();
-        let video = state.screen.as_ref().map(|s| s.video);
-        let done = match (verb, video) {
+
+        let done = match (verb, state.screen.as_mut()) {
             ("open", _) => self.open(host, &mut state, argument),
             (_, None) => Err("no video is open: /video open <file>".into()),
-            ("pause", Some(v)) => host.video_pause(v, true).then_some(()).ok_or("failed".into()),
-            ("play", Some(v)) => host.video_pause(v, false).then_some(()).ok_or("failed".into()),
-            ("seek", Some(v)) => argument
+            ("size", Some(s)) => {
+                let diag: f32 = argument
+                    .parse()
+                    .map_err(|_| "usage: /video size <diagonal in blocks> (e.g. 5.0)".to_string())?;
+                if !(0.5..=50.0).contains(&diag) {
+                    return Err("diagonal must be between 0.5 and 50.0 blocks".into());
+                }
+                s.diagonal = diag;
+                s.recalculate();
+                Ok(())
+            }
+            ("aspect", Some(s)) => {
+                let aspect = AspectRatio::parse(argument)
+                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>".to_string())?;
+                s.aspect = aspect;
+                s.recalculate();
+                Ok(())
+            }
+            ("pause", Some(s)) => host.video_pause(s.video, true).then_some(()).ok_or("failed".into()),
+            ("play", Some(s)) => host.video_pause(s.video, false).then_some(()).ok_or("failed".into()),
+            ("seek", Some(s)) => argument
                 .parse()
                 .ok()
-                .filter(|&seconds| host.video_seek(v, seconds))
+                .filter(|&seconds| host.video_seek(s.video, seconds))
                 .map(|_| ())
                 .ok_or("usage: /video seek <seconds>".into()),
-            ("volume", Some(v)) => argument
+            ("volume", Some(s)) => argument
                 .parse()
                 .ok()
-                .filter(|&volume| host.video_volume(v, volume))
+                .filter(|&volume| host.video_volume(s.video, volume))
                 .map(|_| ())
                 .ok_or("usage: /video volume <0-100>".into()),
-            ("close", Some(v)) => {
-                host.video_close(v);
+            ("close", Some(s)) => {
+                let video = s.video;
+                host.video_close(video);
                 state.screen = None;
                 Ok(())
             }
             ("info", Some(_)) => Ok(()),
-            _ => Err("usage: /video open <file> | pause | play | seek <seconds> | volume <0-100> | close | info".into()),
+            _ => Err("usage: /video open <file> | size <diag> | aspect <ratio> | pause | play | seek <seconds> | volume <0-100> | close | info".into()),
         };
+
         match (&done, &state.screen) {
             (Ok(()), Some(screen)) => host.log("info", &Self::info(host, screen)),
             (Ok(()), None) => host.log("info", "video: closed"),

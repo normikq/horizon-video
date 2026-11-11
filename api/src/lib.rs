@@ -2209,7 +2209,7 @@ impl Hooks for VideoScreen {
         };
         let screen_at = screen.at;
         let screen_yaw = screen.yaw;
-        let screen_diagonal = screen.diagonal;
+        let _screen_diagonal = screen.diagonal;
         let screen_curvature = screen.curvature;
         let (width, height) = screen.dimensions(screen.applied_native_size);
 
@@ -2271,7 +2271,7 @@ impl Hooks for VideoScreen {
         let right = [-cos as f64, -sin as f64];
         let normal = [sin as f64, -cos as f64]; // Normal facing towards viewers/room
 
-        let forward_offset = (0.5).max(width as f64 * 0.02).min(1.2);
+        let forward_offset = (0.5_f64).max(width as f64 * 0.02).min(1.2_f64);
         let pack_rgb = |cr: f32, cg: f32, cb: f32| -> u32 {
             let r = (cr.round() as u32).min(255);
             let g = (cg.round() as u32).min(255);

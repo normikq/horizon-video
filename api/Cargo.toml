@@ -1,0 +1,9 @@
+[package]
+name = "mod-video-screen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The launcher points this at the Horizon source it builds the game from.
+# For standalone building, points to the fork branch with libmpv support.
+horizon-client = { git = "https://github.com/normikq/horizon", branch = "mpv-support" }

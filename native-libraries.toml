@@ -1,0 +1,8 @@
+# Third-party libraries loaded at run time (docs/native-libraries.md).
+# The launcher checks the SHA-256 and copies the library to the game's version directory.
+[[library]]
+name = "libmpv"
+version = "0.40.0"
+platform = "windows-x64"
+file = "libmpv-2.dll"
+sha256 = "0fc3d4a64453fc65b801a687cede8196899788a81a4cd082a9ea477fc418b10f"

@@ -1,0 +1,8 @@
+# Horizon Video Screen: a native trait mod for Horizon.
+# Build with `horizon-launcher native-build . --instance <instance> --trust-native-code`.
+[mod]
+id = "video_screen"
+version = "0.1.0"
+
+[api]
+path = "api"

@@ -3,7 +3,11 @@
 //! Provides the `/video` command:
 //! - `/video open <path>`: spawns a screen in front of the player and plays the file;
 //! - `/video size <diagonal>`: sets screen diagonal in blocks (0.5 to 50.0);
+//! - `/video grow [step]`: increases screen diagonal by step blocks (default 0.5);
+//! - `/video shrink [step]`: decreases screen diagonal by step blocks (default 0.5);
 //! - `/video aspect <ratio>`: sets aspect ratio (e.g. 16:9, 4:3, 21:9, 1:1, or W:H);
+//! - `/video distance <blocks>`: sets screen distance in front of the player (1.0 to 100.0);
+//! - `/video reset`: resets screen dimensions and distance to default;
 //! - `/video pause`, `/video play`, `/video seek <seconds>`, `/video volume <0-100>`, `/video close`;
 //! - `/video info`: playback position, screen dimensions, and frame timing statistics.
 
@@ -151,10 +155,11 @@ impl VideoScreen {
         let size_str = format!("{:.2}x{:.2} blocks (diag {:.2})", w, h, screen.diagonal);
         match host.video_state(screen.video) {
             Some(s) => format!(
-                "video: {:.1}/{:.1} s, size {}, {}{}{} frames; render {} us, game thread {} us taking + {} us staging",
+                "video: {:.1}/{:.1} s, size {}, dist {:.1} blk, {}{}{} frames; render {} us, game thread {} us taking + {} us staging",
                 s.position.unwrap_or(0.0),
                 s.duration.unwrap_or(0.0),
                 size_str,
+                screen.distance,
                 if s.paused { "paused, " } else { "" },
                 if s.failed { "FAILED, " } else { "" },
                 s.frames,
@@ -198,10 +203,52 @@ impl Hooks for VideoScreen {
                 s.recalculate();
                 Ok(())
             }
+            ("grow", Some(s)) => {
+                let step: f32 = if argument.is_empty() {
+                    0.5
+                } else {
+                    argument
+                        .parse()
+                        .map_err(|_| "usage: /video grow [step in blocks]".to_string())?
+                };
+                s.diagonal = (s.diagonal + step).clamp(0.5, 50.0);
+                s.recalculate();
+                Ok(())
+            }
+            ("shrink", Some(s)) => {
+                let step: f32 = if argument.is_empty() {
+                    0.5
+                } else {
+                    argument
+                        .parse()
+                        .map_err(|_| "usage: /video shrink [step in blocks]".to_string())?
+                };
+                s.diagonal = (s.diagonal - step).clamp(0.5, 50.0);
+                s.recalculate();
+                Ok(())
+            }
+            ("distance", Some(s)) => {
+                let dist: f64 = argument
+                    .parse()
+                    .map_err(|_| "usage: /video distance <blocks> (e.g. 5.0)".to_string())?;
+                if !(1.0..=100.0).contains(&dist) {
+                    return Err("distance must be between 1.0 and 100.0 blocks".into());
+                }
+                s.distance = dist;
+                s.recalculate();
+                Ok(())
+            }
             ("aspect", Some(s)) => {
                 let aspect = AspectRatio::parse(argument)
                     .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | W:H>".to_string())?;
                 s.aspect = aspect;
+                s.recalculate();
+                Ok(())
+            }
+            ("reset", Some(s)) => {
+                s.diagonal = DEFAULT_DIAGONAL;
+                s.aspect = AspectRatio::Ratio(DEFAULT_ASPECT);
+                s.distance = DEFAULT_DISTANCE;
                 s.recalculate();
                 Ok(())
             }
@@ -226,11 +273,36 @@ impl Hooks for VideoScreen {
                 Ok(())
             }
             ("info", Some(_)) => Ok(()),
-            _ => Err("usage: /video open <file> | size <diag> | aspect <ratio> | pause | play | seek <seconds> | volume <0-100> | close | info".into()),
+            _ => Err("usage: /video open <file> | size <diag> | grow [step] | shrink [step] | aspect <ratio> | distance <dist> | reset | pause | play | seek <seconds> | volume <0-100> | close | info".into()),
         };
 
         match (&done, &state.screen) {
-            (Ok(()), Some(screen)) => host.log("info", &Self::info(host, screen)),
+            (Ok(()), Some(screen)) => match verb {
+                "size" | "grow" | "shrink" | "aspect" => {
+                    let (w, h) = screen.dimensions();
+                    host.log(
+                        "info",
+                        &format!(
+                            "video: resized to {:.2}x{:.2} blocks (diagonal {:.2})",
+                            w, h, screen.diagonal
+                        ),
+                    );
+                }
+                "distance" => {
+                    host.log(
+                        "info",
+                        &format!("video: distance set to {:.1} blocks", screen.distance),
+                    );
+                }
+                "reset" => {
+                    host.log(
+                        "info",
+                        "video: screen reset to default size (4.0x2.25) and distance (4.0)",
+                    );
+                }
+                "info" => host.log("info", &Self::info(host, screen)),
+                _ => {}
+            },
             (Ok(()), None) => host.log("info", "video: closed"),
             (Err(why), _) => host.log("warn", &format!("video: {why}")),
         }

@@ -2209,7 +2209,7 @@ impl Hooks for VideoScreen {
         };
         let screen_at = screen.at;
         let screen_yaw = screen.yaw;
-        let _screen_diagonal = screen.diagonal;
+        let screen_diagonal = screen.diagonal;
         let screen_curvature = screen.curvature;
         let (width, height) = screen.dimensions(screen.applied_native_size);
 
@@ -2271,7 +2271,7 @@ impl Hooks for VideoScreen {
         let right = [-cos as f64, -sin as f64];
         let normal = [sin as f64, -cos as f64]; // Normal facing towards viewers/room
 
-        let forward_offset = (0.5_f64).max(width as f64 * 0.02).min(1.2_f64);
+        let forward_offset = (0.8_f64).max(width as f64 * 0.03).min(2.0_f64);
         let pack_rgb = |cr: f32, cg: f32, cb: f32| -> u32 {
             let r = (cr.round() as u32).min(255);
             let g = (cg.round() as u32).min(255);
@@ -2303,12 +2303,12 @@ impl Hooks for VideoScreen {
             vec![(height as f64 * 0.45, 1.0)]
         };
 
-        let light_radius = ((width / n_cols as f32) * 2.5)
-            .max(height * 1.3)
-            .max(8.0)
-            .min(48.0);
+        let light_radius = (screen_diagonal * 1.5)
+            .max(width * 1.2)
+            .max(24.0)
+            .min(64.0);
 
-        let norm_factor = if is_tall { 6.2 } else { 3.8 };
+        let norm_factor = if is_tall { 2.4 } else { 1.8 };
         let base_light_intensity = (intensity / norm_factor).clamp(0.01, 1.0);
 
         let alpha = screen_curvature.to_radians() as f64;

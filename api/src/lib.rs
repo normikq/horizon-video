@@ -22,17 +22,24 @@
 //!   `/video volume <0-100>`, `/video close`, `/video info`.
 
 use horizon_client::mod_api::{
-    ClickEvent, CommandEvent, CommandsEvent, Flow, FrameEvent, Hooks, Host, NativeCamera,
+    ClickEvent, ClientLevelUnloadEvent, CommandEvent, CommandsEvent, Flow, FrameEvent, Hooks,
+    Host, NativeCamera,
     NativeColoredLight, NativeHit, PrimitiveShape, ScreenMouseButtonPressedPreEvent,
     ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreV2Event, ScreenRenderPostEvent, Style,
     Text, VisualsEvent, WorldPrimitivesEvent, WorldSubmitEvent, serde_json,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 const SCREENS_FILE: &str = "video_screens.json";
+/// The mod's id, as the mixer keys its audio sources by.
+const MOD_ID: &str = "horizon_video";
+/// The sample rate when the game does not say (`video_audio_rate`).
+const FALLBACK_RATE: u32 = 48_000;
+/// The most a video may have in its 7.1 layout: one audio source each.
+const MAX_CHANNELS: u128 = 8;
 const CURVE_SLICES: usize = 24;
 
 /// The default screen diagonal in blocks (~4.589 blocks corresponds to 4.0 x 2.25 at 16:9).
@@ -62,22 +69,20 @@ impl AspectRatio {
             if w > 0.0 && h > 0.0 {
                 return Some(Self::Ratio(w / h));
             }
-        } else if let Ok(val) = s.parse::<f32>() {
-            if val > 0.0 {
+        } else if let Ok(val) = s.parse::<f32>()
+            && val > 0.0 {
                 return Some(Self::Ratio(val));
             }
-        }
         None
     }
 
     pub fn value(&self, native_size: Option<(u32, u32)>) -> f32 {
         match self {
             Self::Auto => {
-                if let Some((w, h)) = native_size {
-                    if h > 0 {
+                if let Some((w, h)) = native_size
+                    && h > 0 {
                         return w as f32 / h as f32;
                     }
-                }
                 DEFAULT_ASPECT
             }
             Self::Ratio(r) => *r,
@@ -120,6 +125,9 @@ pub struct SavedScreen {
     pub curvature: f32,
     #[serde(default)]
     pub speakers: HashMap<SpeakerId, [f64; 3]>,
+    /// The audio mode it plays with; none in files from before it was kept.
+    #[serde(default)]
+    pub audio_mode: Option<AudioMode>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,7 +399,7 @@ impl SpeakerLayout {
 }
 
 /// Audio output modes for screen playback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AudioMode {
     /// 3D Spatial Audio: positioned at the screen center with 3D HRTF panning,
     /// distance attenuation up to 48 blocks, and wall occlusion muffling.
@@ -440,6 +448,10 @@ struct State {
     active_drag: Option<DragTarget>,
     /// Previous frame's RMB state to detect initial press transition
     prev_right_down: bool,
+    /// Where the saved screens are kept; none until a hook has asked the game.
+    screens_path: Option<PathBuf>,
+    /// When sound was last taken, for how much to take this frame.
+    audio_at: Option<Instant>,
 }
 
 impl Default for State {
@@ -462,41 +474,141 @@ impl Default for State {
             hovered_target: None,
             active_drag: None,
             prev_right_down: false,
+            screens_path: None,
+            audio_at: None,
         }
     }
 }
 
-fn screens_file_path() -> PathBuf {
-    let local = PathBuf::from(SCREENS_FILE);
-    if local.exists() {
-        return local;
-    }
+/// Where the screens are kept: the game's shared config folder
+/// (`config/video_screens.json`), not wherever the game was started from.
+fn screens_path(host: &dyn Host) -> PathBuf {
+    host.config_dir()
+        .map(|dir| dir.join(SCREENS_FILE))
+        .unwrap_or_else(|_| PathBuf::from(SCREENS_FILE))
+}
+
+/// Where earlier versions kept the screens: the working directory, then
+/// `%APPDATA%\horizon`. Read once while the config folder has none.
+fn legacy_screens_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(SCREENS_FILE)];
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let appdata_path = PathBuf::from(appdata).join("horizon").join(SCREENS_FILE);
-        if appdata_path.exists() {
-            return appdata_path;
-        }
+        paths.push(PathBuf::from(appdata).join("horizon").join(SCREENS_FILE));
     }
-    local
+    paths
 }
 
-fn load_saved_screens() -> HashMap<String, SavedScreen> {
-    let path = screens_file_path();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        let content = content.trim_start_matches('\u{feff}');
-        serde_json::from_str(content).unwrap_or_default()
-    } else {
-        HashMap::new()
+/// The screens saved at `path`, or at an earlier version's place while there are none.
+fn load_saved_screens(path: &Path) -> HashMap<String, SavedScreen> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let Some(content) = read(path).or_else(|| legacy_screens_paths().iter().find_map(|p| read(p)))
+    else {
+        return HashMap::new();
+    };
+    let content = content.trim_start_matches('\u{feff}');
+    serde_json::from_str(content).unwrap_or_default()
+}
+
+/// Reads the saved screens the first time a hook can ask the game where they are.
+fn ensure_screens(host: &dyn Host, state: &mut State) {
+    if state.screens_path.is_none() {
+        let path = screens_path(host);
+        state.saved_screens = load_saved_screens(&path);
+        state.screens_path = Some(path);
     }
 }
 
-fn save_saved_screens(screens: &HashMap<String, SavedScreen>) -> Result<(), String> {
-    let path = screens_file_path();
-    let json = serde_json::to_string_pretty(screens)
+fn save_saved_screens(state: &State) -> Result<(), String> {
+    let path = state
+        .screens_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(SCREENS_FILE));
+    let json = serde_json::to_string_pretty(&state.saved_screens)
         .map_err(|e| format!("failed to serialize screens: {e}"))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    }
     std::fs::write(&path, json)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// The first of `video`'s audio sources in the mixer; a channel's is this plus its index.
+fn voice_base(video: u32) -> u128 {
+    u128::from(video) << 4
+}
+
+/// Every audio source `video` may use.
+fn voices(video: u32) -> Vec<u128> {
+    (0..MAX_CHANNELS).map(|i| voice_base(video) + i).collect()
+}
+
+/// Closes `video` and drops what it still had waiting in the mixer.
+fn stop_video(host: &mut dyn Host, video: u32) {
+    host.video_close(video);
+    host.clear_voices(MOD_ID, &voices(video));
+}
+
+/// A frame's worth of a video's sound, found under the lock and taken and
+/// played after it, so the host calls never run while the lock is held.
+struct AudioJob {
+    video: u32,
+    mode: AudioMode,
+    speakers: SpeakerLayout,
+    /// Seconds since sound was last taken.
+    elapsed: f64,
+}
+
+impl AudioJob {
+    fn play(self, host: &mut dyn Host) {
+        let rate = host.video_audio_rate(self.video).unwrap_or(FALLBACK_RATE);
+        // Twice what played since the last frame, and at least a 30 FPS
+        // frame's: a slow frame takes its whole share and nothing piles up.
+        let elapsed = self.elapsed.clamp(0.0, 0.25);
+        let max = ((f64::from(rate) * elapsed * 2.0).ceil() as u32).max(rate / 30);
+        let (video, spk) = (self.video, &self.speakers);
+        let (channels, places): (Vec<Vec<f32>>, Vec<Option<[f64; 3]>>) = match self.mode {
+            AudioMode::Surround71 => match host.video_audio_71(video, max) {
+                // FL, FR, FC, LFE, BL, BR, SL, SR
+                Some(ch) => (
+                    Vec::from(ch),
+                    [spk.fl, spk.fr, spk.c, spk.lfe, spk.bl, spk.br, spk.sl, spk.sr]
+                        .map(Some)
+                        .to_vec(),
+                ),
+                None => return,
+            },
+            AudioMode::Surround51 => match host.video_audio_51(video, max) {
+                // FL, FR, FC, LFE, SL, SR
+                Some(ch) => (
+                    Vec::from(ch),
+                    [spk.fl, spk.fr, spk.c, spk.lfe, spk.sl, spk.sr]
+                        .map(Some)
+                        .to_vec(),
+                ),
+                None => return,
+            },
+            AudioMode::StereoSpeakers => match host.video_audio_stereo(video, max) {
+                Some((left, right)) => (vec![left, right], vec![Some(spk.fl), Some(spk.fr)]),
+                None => return,
+            },
+            AudioMode::Game3D => match host.video_audio(video, max) {
+                Some(mono) => (vec![mono], vec![Some(spk.c)]),
+                None => return,
+            },
+            AudioMode::Direct => match host.video_audio(video, max) {
+                Some(mono) => (vec![mono], vec![None]),
+                None => return,
+            },
+            AudioMode::Mute => return,
+        };
+        // Whatever number of channels came, each has its own source and place;
+        // all are queued together so they stay lined up.
+        let count = channels.len().min(places.len());
+        let sources: Vec<u128> = (0..count as u128).map(|i| voice_base(video) + i).collect();
+        host.push_voices(MOD_ID, &sources, &channels[..count], rate, &places[..count]);
+    }
 }
 
 pub struct VideoScreen(Mutex<State>);
@@ -504,7 +616,6 @@ pub struct VideoScreen(Mutex<State>);
 impl Default for VideoScreen {
     fn default() -> Self {
         Self(Mutex::new(State {
-            saved_screens: load_saved_screens(),
             demo: std::env::var("HORIZON_VIDEO_DEMO").ok(),
             ..State::default()
         }))
@@ -512,14 +623,200 @@ impl Default for VideoScreen {
 }
 
 impl VideoScreen {
+    /// The mod's state. A panic in an earlier hook leaves it as it was, not
+    /// poisoned: the next hook goes on with it rather than failing too.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A frame's work on the state: the screen, the editor, the light. Gives
+    /// the sound to take and play, which `frame` does after the lock.
+    fn frame_locked(&self, host: &mut dyn Host, state: &mut State) -> Option<AudioJob> {
+        ensure_screens(&*host, state);
+        // A video the game closed (the world was left) is gone: forget its id.
+        if let Some(screen) = state.screen.as_mut()
+            && let Some(video) = screen.video
+            && host.video_state(video).is_none()
+        {
+            screen.video = None;
+            host.clear_voices(MOD_ID, &voices(video));
+        }
+        if let Some(path) = state.demo.take() {
+            match self.open(host, state, &path) {
+                Ok(()) => host.log("info", &format!("video: playing {path}")),
+                Err(_) if host.camera().is_none() => state.demo = Some(path),
+                Err(why) => host.log("warn", &format!("video: {why}")),
+            }
+        }
+
+        // Automatic aspect ratio detection from video stream metadata
+        if let Some(screen) = state.screen.as_mut()
+            && screen.aspect == AspectRatio::Auto
+                && let Some(video) = screen.video
+                    && let Some(native_size) = host.video_state(video).and_then(|s| s.video_size)
+                        && Some(native_size) != screen.applied_native_size {
+                            screen.recalculate(Some(native_size));
+                            let (w, h) = screen.dimensions(Some(native_size));
+                            let (nw, nh) = native_size;
+                            host.log(
+                                "info",
+                                &format!(
+                                    "video: auto-detected video stream resolution {}x{} -> screen adjusted to {:.2}x{:.2} blocks",
+                                    nw, nh, w, h
+                                ),
+                            );
+                        }
+
+        // The video's sound for the game's mixer: what to take is decided
+        // here, the taking and playing happen once the lock is let go.
+        let now = Instant::now();
+        let elapsed = state
+            .audio_at
+            .replace(now)
+            .map_or(1.0 / 60.0, |at| now.duration_since(at).as_secs_f64());
+        let mut audio = None;
+        if let Some(screen) = &state.screen
+            && let Some(video) = screen.video
+            && state.audio_mode != AudioMode::Mute
+        {
+            let native_size = host.video_state(video).and_then(|s| s.video_size);
+            let (w, h) = screen.dimensions(native_size);
+            audio = Some(AudioJob {
+                video,
+                mode: state.audio_mode,
+                speakers: SpeakerLayout::compute(screen.at, screen.yaw, w, h, &screen.custom_speakers),
+                elapsed,
+            });
+        }
+
+        // 3D crosshair raycasting and RMB (ПКМ) dragging of screen handles, center, and speakers
+        let right_down = host.has_right_down();
+        let prev_right_down = state.prev_right_down;
+        state.prev_right_down = right_down;
+
+        let is_editing = state.editing.is_some();
+        let show_speakers = state.show_speakers || is_editing;
+        let grid_snap = state.grid_snap;
+        let audio_mode = state.audio_mode;
+        let mut hovered_target = state.hovered_target;
+        let mut active_drag = state.active_drag;
+
+        let camera_opt = host.camera();
+        if let (Some(camera), Some(screen)) = (camera_opt.as_ref(), state.screen.as_mut()) {
+            let ray_dir = Self::crosshair_ray(camera);
+            let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
+
+            if right_down {
+                if !prev_right_down && active_drag.is_none() {
+                    // Pressed RMB on this frame: grab hovered target
+                    if let Some(target) = hovered_target {
+                        active_drag = Some(target);
+                    }
+                }
+
+                if let Some(active) = active_drag {
+                    match active {
+                        DragTarget::Handle(handle) => {
+                            if let Some((u, v)) = Self::ray_intersect_screen_plane(screen, camera.position, ray_dir) {
+                                Self::apply_drag(screen, handle, u as f32, v as f32, native_size, grid_snap);
+                            }
+                        }
+                        DragTarget::Speaker(spk_id, dist) => {
+                            let mut new_pos = [
+                                camera.position[0] + ray_dir[0] * dist,
+                                camera.position[1] + ray_dir[1] * dist,
+                                camera.position[2] + ray_dir[2] * dist,
+                            ];
+                            if let Some(step) = grid_snap {
+                                let s = f64::from(step);
+                                new_pos[0] = (new_pos[0] / s).round() * s;
+                                new_pos[1] = (new_pos[1] / s).round() * s;
+                                new_pos[2] = (new_pos[2] / s).round() * s;
+                            }
+                            screen.custom_speakers.insert(spk_id, new_pos);
+                        }
+                        DragTarget::ScreenCenter { initial_dist } => {
+                            let (_w, h) = screen.dimensions(native_size);
+                            let new_center = [
+                                camera.position[0] + ray_dir[0] * initial_dist,
+                                camera.position[1] + ray_dir[1] * initial_dist,
+                                camera.position[2] + ray_dir[2] * initial_dist,
+                            ];
+                            let mut new_at = [
+                                new_center[0],
+                                new_center[1] - f64::from(h) * 0.5,
+                                new_center[2],
+                            ];
+                            if let Some(step) = grid_snap {
+                                let s = f64::from(step);
+                                new_at[0] = (new_at[0] / s).round() * s;
+                                new_at[1] = (new_at[1] / s).round() * s;
+                                new_at[2] = (new_at[2] / s).round() * s;
+                            }
+                            screen.at = new_at;
+                        }
+                    }
+                }
+            } else {
+                // Released RMB
+                if let Some(finished) = active_drag.take() {
+                    match finished {
+                        DragTarget::Handle(_) => {
+                            let (w, h) = screen.dimensions(native_size);
+                            host.feedback(Text::colored(
+                                format!("§6[Horizon Video] §aРазмер экрана зафиксирован: §b{:.2}x{:.2} бл §7(диагональ {:.2}).", w, h, screen.diagonal),
+                                0x55FF55,
+                            ));
+                        }
+                        DragTarget::Speaker(id, _) => {
+                            if let Some(pos) = screen.custom_speakers.get(&id) {
+                                host.feedback(Text::colored(
+                                    format!("§6[Horizon Video] §aПозиция колонки §e{} §aзафиксирована: §7[{:.2}, {:.2}, {:.2}].", id.name(), pos[0], pos[1], pos[2]),
+                                    0x55FF55,
+                                ));
+                            }
+                        }
+                        DragTarget::ScreenCenter { .. } => {
+                            host.feedback(Text::colored(
+                                format!("§6[Horizon Video] §aПозиция экрана зафиксирована: §7[{:.2}, {:.2}, {:.2}].", screen.at[0], screen.at[1], screen.at[2]),
+                                0x55FF55,
+                            ));
+                        }
+                    }
+                }
+
+                // Update hovered target for visual highlighting
+                hovered_target = Self::find_crosshair_target(
+                    screen,
+                    camera.position,
+                    ray_dir,
+                    is_editing,
+                    show_speakers,
+                    audio_mode,
+                );
+            }
+        }
+        state.active_drag = active_drag;
+        state.hovered_target = hovered_target;
+
+        let due = state
+            .reported
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
+        if let (true, Some(screen)) = (due, &state.screen) {
+            host.log("info", &Self::info(host, screen));
+            state.reported = Some(Instant::now());
+        }
+        audio
+    }
+
+
     fn open(&self, host: &mut dyn Host, state: &mut State, path: &str) -> Result<(), String> {
         let camera = host.camera().ok_or("no world is shown yet")?;
         let video = host.video_open(path, 1280, 720, true)?;
-        if let Some(old) = state.screen.take() {
-            if let Some(v) = old.video {
-                host.video_close(v);
+        if let Some(old) = state.screen.take()
+            && let Some(v) = old.video {
+                stop_video(host, v);
             }
-        }
         state.screen = Some(Screen::new(Some(video), camera.position, camera.yaw));
         Ok(())
     }
@@ -532,11 +829,10 @@ impl VideoScreen {
         path: &str,
     ) -> Result<(), String> {
         let video = host.video_open(path, 1280, 720, true)?;
-        if let Some(old) = state.screen.take() {
-            if let Some(v) = old.video {
-                host.video_close(v);
+        if let Some(old) = state.screen.take()
+            && let Some(v) = old.video {
+                stop_video(host, v);
             }
-        }
         state.screen = Some(Screen::from_saved(saved, Some(video)));
         Ok(())
     }
@@ -1185,7 +1481,8 @@ impl Hooks for VideoScreen {
         let rest = rest.trim();
         let (verb, argument) = rest.split_once(' ').unwrap_or((rest, ""));
         let argument = argument.trim().trim_matches('"');
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
+        ensure_screens(&*host, &mut state);
 
         let done = match verb {
             "create" => (|| -> Result<(), String> {
@@ -1202,7 +1499,7 @@ impl Hooks for VideoScreen {
                 state.editing = Some(EditState { id, active_handle: None });
                 Ok(())
             })(),
-            "edit" => (|| -> Result<(), String> {
+            "edit" => {
                 let id = if argument.is_empty() {
                     state.editing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| "main".into())
                 } else {
@@ -1222,7 +1519,7 @@ impl Hooks for VideoScreen {
                 } else {
                     Err(format!("screen '{id}' not found: use /video create {id}"))
                 }
-            })(),
+            },
             "save" => (|| -> Result<(), String> {
                 let id = if !argument.is_empty() {
                     argument.to_string()
@@ -1246,9 +1543,10 @@ impl Hooks for VideoScreen {
                     height: h,
                     curvature: screen.curvature,
                     speakers: screen.custom_speakers.clone(),
+                    audio_mode: Some(state.audio_mode),
                 };
                 state.saved_screens.insert(id.clone(), saved);
-                save_saved_screens(&state.saved_screens)?;
+                save_saved_screens(&state)?;
                 state.editing = None;
                 host.feedback(Text::colored(
                     format!("§a[Horizon Video] Экран '§e{}§a' сохранен! ({:.2}x{:.2} бл). Запуск: §b/video play {} <файл>", id, w, h, id),
@@ -1341,7 +1639,7 @@ impl Hooks for VideoScreen {
                     return Err("usage: /video remove <id>".into());
                 }
                 if state.saved_screens.remove(argument).is_some() {
-                    save_saved_screens(&state.saved_screens)?;
+                    save_saved_screens(&state)?;
                     host.feedback(Text::colored(format!("§a[Horizon Video] Экран '{}' удален.", argument), 0x55FF55));
                     Ok(())
                 } else {
@@ -1353,17 +1651,19 @@ impl Hooks for VideoScreen {
                     let path = path.trim().trim_matches('"');
                     let id = id.trim();
                     if let Some(saved) = state.saved_screens.get(id).cloned() {
+                        if let Some(mode) = saved.audio_mode {
+                            state.audio_mode = mode;
+                        }
                         return self.open_on_screen(host, &mut state, &saved, path);
                     } else {
                         return Err(format!("экран '{id}' не найден. Сохраните его командой /video save {id}"));
                     }
                 }
-                if let Some(screen) = state.screen.as_mut() {
-                    if let Some(v) = screen.video {
+                if let Some(screen) = state.screen.as_mut()
+                    && let Some(v) = screen.video {
                         host.video_pause(v, false);
                         return Ok(());
                     }
-                }
                 Err("usage: /video play <screen_id> <path> | /video play (unpause)".into())
             })(),
             "open" => self.open(host, &mut state, argument),
@@ -1445,7 +1745,7 @@ impl Hooks for VideoScreen {
                     return Ok(());
                 }
                 let aspect = AspectRatio::parse(argument)
-                    .ok_or_else(|| "usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | auto | W:H>")?;
+                    .ok_or("usage: /video aspect <16:9 | 4:3 | 21:9 | 1:1 | auto | W:H>")?;
                 s.aspect = aspect;
                 let native_size = s.video.and_then(|v| host.video_state(v)).and_then(|st| st.video_size);
                 s.recalculate(native_size);
@@ -1493,7 +1793,14 @@ impl Hooks for VideoScreen {
                 argument
                     .parse()
                     .ok()
-                    .filter(|&seconds| host.video_seek(v, seconds))
+                    .filter(|&seconds| {
+                        let jumped = host.video_seek(v, seconds);
+                        if jumped {
+                            // What the mixer still holds is from before the jump.
+                            host.clear_voices(MOD_ID, &voices(v));
+                        }
+                        jumped
+                    })
                     .map(|_| ())
                     .ok_or("usage: /video seek <seconds>".into())
             })(),
@@ -1508,11 +1815,10 @@ impl Hooks for VideoScreen {
                     .ok_or("usage: /video volume <0-100>".into())
             })(),
             "close" => {
-                if let Some(s) = state.screen.take() {
-                    if let Some(v) = s.video {
-                        host.video_close(v);
+                if let Some(s) = state.screen.take()
+                    && let Some(v) = s.video {
+                        stop_video(host, v);
                     }
-                }
                 state.editing = None;
                 Ok(())
             }
@@ -1552,7 +1858,7 @@ impl Hooks for VideoScreen {
                 }
                 Ok(())
             })(),
-            "speakers" | "visuals" => (|| -> Result<(), String> {
+            "speakers" | "visuals" => {
                 let show = match argument.to_ascii_lowercase().as_str() {
                     "on" | "1" | "true" | "вкл" => true,
                     "off" | "0" | "false" | "выкл" => false,
@@ -1569,7 +1875,7 @@ impl Hooks for VideoScreen {
                     0xFFAA00,
                 ));
                 Ok(())
-            })(),
+            },
             "audio" | "sound" => (|| -> Result<(), String> {
                 if argument.is_empty() {
                     let mode_str = match state.audio_mode {
@@ -1671,216 +1977,27 @@ impl Hooks for VideoScreen {
     }
 
     fn frame(&self, host: &mut dyn Host, _: &mut FrameEvent) {
-        let mut state = self.0.lock().unwrap();
-        if let Some(path) = state.demo.take() {
-            match self.open(host, &mut state, &path) {
-                Ok(()) => host.log("info", &format!("video: playing {path}")),
-                Err(_) if host.camera().is_none() => state.demo = Some(path),
-                Err(why) => host.log("warn", &format!("video: {why}")),
-            }
-        }
-
-        // Automatic aspect ratio detection from video stream metadata
-        if let Some(screen) = state.screen.as_mut() {
-            if screen.aspect == AspectRatio::Auto {
-                if let Some(video) = screen.video {
-                    if let Some(native_size) = host.video_state(video).and_then(|s| s.video_size) {
-                        if Some(native_size) != screen.applied_native_size {
-                            screen.recalculate(Some(native_size));
-                            let (w, h) = screen.dimensions(Some(native_size));
-                            let (nw, nh) = native_size;
-                            host.log(
-                                "info",
-                                &format!(
-                                    "video: auto-detected video stream resolution {}x{} -> screen adjusted to {:.2}x{:.2} blocks",
-                                    nw, nh, w, h
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3D Spatial Audio ingestion into Horizon game mixer
-        if let Some(screen) = &state.screen {
-            if let Some(video) = screen.video {
-                let audio_mode = state.audio_mode;
-                if audio_mode != AudioMode::Mute {
-                    const MAX_FRAME_SAMPLES: u32 = 1600;
-                    let native_size = host.video_state(video).and_then(|s| s.video_size);
-                    let (w, h) = screen.dimensions(native_size);
-                    let spk = SpeakerLayout::compute(screen.at, screen.yaw, w, h, &screen.custom_speakers);
-                    let source = (video as u128) << 4;
-
-                    match audio_mode {
-                        AudioMode::Surround71 => {
-                            if let Some(ch) = host.video_audio_71(video, MAX_FRAME_SAMPLES) {
-                                // 0: FL, 1: FR, 2: FC, 3: LFE, 4: BL, 5: BR, 6: SL, 7: SR
-                                host.push_voice("horizon_video", source + 0, &ch[0], 48000, Some(spk.fl));
-                                host.push_voice("horizon_video", source + 1, &ch[1], 48000, Some(spk.fr));
-                                host.push_voice("horizon_video", source + 2, &ch[2], 48000, Some(spk.c));
-                                host.push_voice("horizon_video", source + 3, &ch[3], 48000, Some(spk.lfe));
-                                host.push_voice("horizon_video", source + 4, &ch[4], 48000, Some(spk.bl));
-                                host.push_voice("horizon_video", source + 5, &ch[5], 48000, Some(spk.br));
-                                host.push_voice("horizon_video", source + 6, &ch[6], 48000, Some(spk.sl));
-                                host.push_voice("horizon_video", source + 7, &ch[7], 48000, Some(spk.sr));
-                            }
-                        }
-                        AudioMode::Surround51 => {
-                            if let Some(ch) = host.video_audio_51(video, MAX_FRAME_SAMPLES) {
-                                // 0: FL, 1: FR, 2: FC, 3: LFE, 4: SL, 5: SR
-                                host.push_voice("horizon_video", source + 0, &ch[0], 48000, Some(spk.fl));
-                                host.push_voice("horizon_video", source + 1, &ch[1], 48000, Some(spk.fr));
-                                host.push_voice("horizon_video", source + 2, &ch[2], 48000, Some(spk.c));
-                                host.push_voice("horizon_video", source + 3, &ch[3], 48000, Some(spk.lfe));
-                                host.push_voice("horizon_video", source + 4, &ch[4], 48000, Some(spk.sl));
-                                host.push_voice("horizon_video", source + 5, &ch[5], 48000, Some(spk.sr));
-                            }
-                        }
-                        AudioMode::StereoSpeakers => {
-                            if let Some((left, right)) = host.video_audio_stereo(video, MAX_FRAME_SAMPLES) {
-                                host.push_voice("horizon_video", source + 0, &left, 48000, Some(spk.fl));
-                                host.push_voice("horizon_video", source + 1, &right, 48000, Some(spk.fr));
-                            }
-                        }
-                        AudioMode::Game3D => {
-                            if let Some(samples) = host.video_audio(video, MAX_FRAME_SAMPLES) {
-                                host.push_voice("horizon_video", source, &samples, 48000, Some(spk.c));
-                            }
-                        }
-                        AudioMode::Direct => {
-                            if let Some(samples) = host.video_audio(video, MAX_FRAME_SAMPLES) {
-                                host.push_voice("horizon_video", source, &samples, 48000, None);
-                            }
-                        }
-                        AudioMode::Mute => {}
-                    }
-                }
-            }
-        }
-
-        // 3D crosshair raycasting and RMB (ПКМ) dragging of screen handles, center, and speakers
-        let right_down = host.has_right_down();
-        let prev_right_down = state.prev_right_down;
-        state.prev_right_down = right_down;
-
-        let is_editing = state.editing.is_some();
-        let show_speakers = state.show_speakers || is_editing;
-        let grid_snap = state.grid_snap;
-        let audio_mode = state.audio_mode;
-        let mut hovered_target = state.hovered_target;
-        let mut active_drag = state.active_drag;
-
-        let camera_opt = host.camera();
-        if let (Some(camera), Some(screen)) = (camera_opt.as_ref(), state.screen.as_mut()) {
-            let ray_dir = Self::crosshair_ray(camera);
-            let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
-
-            if right_down {
-                if !prev_right_down && active_drag.is_none() {
-                    // Pressed RMB on this frame: grab hovered target
-                    if let Some(target) = hovered_target {
-                        active_drag = Some(target);
-                    }
-                }
-
-                if let Some(active) = active_drag {
-                    match active {
-                        DragTarget::Handle(handle) => {
-                            if let Some((u, v)) = Self::ray_intersect_screen_plane(screen, camera.position, ray_dir) {
-                                Self::apply_drag(screen, handle, u as f32, v as f32, native_size, grid_snap);
-                            }
-                        }
-                        DragTarget::Speaker(spk_id, dist) => {
-                            let mut new_pos = [
-                                camera.position[0] + ray_dir[0] * dist,
-                                camera.position[1] + ray_dir[1] * dist,
-                                camera.position[2] + ray_dir[2] * dist,
-                            ];
-                            if let Some(step) = grid_snap {
-                                let s = f64::from(step);
-                                new_pos[0] = (new_pos[0] / s).round() * s;
-                                new_pos[1] = (new_pos[1] / s).round() * s;
-                                new_pos[2] = (new_pos[2] / s).round() * s;
-                            }
-                            screen.custom_speakers.insert(spk_id, new_pos);
-                        }
-                        DragTarget::ScreenCenter { initial_dist } => {
-                            let (_w, h) = screen.dimensions(native_size);
-                            let new_center = [
-                                camera.position[0] + ray_dir[0] * initial_dist,
-                                camera.position[1] + ray_dir[1] * initial_dist,
-                                camera.position[2] + ray_dir[2] * initial_dist,
-                            ];
-                            let mut new_at = [
-                                new_center[0],
-                                new_center[1] - f64::from(h) * 0.5,
-                                new_center[2],
-                            ];
-                            if let Some(step) = grid_snap {
-                                let s = f64::from(step);
-                                new_at[0] = (new_at[0] / s).round() * s;
-                                new_at[1] = (new_at[1] / s).round() * s;
-                                new_at[2] = (new_at[2] / s).round() * s;
-                            }
-                            screen.at = new_at;
-                        }
-                    }
-                }
-            } else {
-                // Released RMB
-                if let Some(finished) = active_drag.take() {
-                    match finished {
-                        DragTarget::Handle(_) => {
-                            let (w, h) = screen.dimensions(native_size);
-                            host.feedback(Text::colored(
-                                format!("§6[Horizon Video] §aРазмер экрана зафиксирован: §b{:.2}x{:.2} бл §7(диагональ {:.2}).", w, h, screen.diagonal),
-                                0x55FF55,
-                            ));
-                        }
-                        DragTarget::Speaker(id, _) => {
-                            if let Some(pos) = screen.custom_speakers.get(&id) {
-                                host.feedback(Text::colored(
-                                    format!("§6[Horizon Video] §aПозиция колонки §e{} §aзафиксирована: §7[{:.2}, {:.2}, {:.2}].", id.name(), pos[0], pos[1], pos[2]),
-                                    0x55FF55,
-                                ));
-                            }
-                        }
-                        DragTarget::ScreenCenter { .. } => {
-                            host.feedback(Text::colored(
-                                format!("§6[Horizon Video] §aПозиция экрана зафиксирована: §7[{:.2}, {:.2}, {:.2}].", screen.at[0], screen.at[1], screen.at[2]),
-                                0x55FF55,
-                            ));
-                        }
-                    }
-                }
-
-                // Update hovered target for visual highlighting
-                hovered_target = Self::find_crosshair_target(
-                    screen,
-                    camera.position,
-                    ray_dir,
-                    is_editing,
-                    show_speakers,
-                    audio_mode,
-                );
-            }
-        }
-        state.active_drag = active_drag;
-        state.hovered_target = hovered_target;
-
-        let due = state
-            .reported
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
-        if let (true, Some(screen)) = (due, &state.screen) {
-            host.log("info", &Self::info(host, screen));
-            state.reported = Some(Instant::now());
+        let audio = self.frame_locked(host, &mut self.state());
+        if let Some(audio) = audio {
+            audio.play(host);
         }
     }
 
+    /// Once the world is left the screen goes with it; its video is closed
+    /// and its sound dropped, the saved screens stay.
+    fn client_level_unload(&self, host: &mut dyn Host, _: &mut ClientLevelUnloadEvent<'_>) {
+        let mut state = self.state();
+        if let Some(video) = state.screen.take().and_then(|s| s.video) {
+            stop_video(host, video);
+        }
+        state.editing = None;
+        state.hovered_target = None;
+        state.active_drag = None;
+        state.audio_at = None;
+    }
+
     fn world_submit(&self, host: &dyn Host, event: &mut WorldSubmitEvent<'_>) {
-        let state = self.0.lock().unwrap();
+        let state = self.state();
         let Some(screen) = &state.screen else { return };
         if let Some(video) = screen.video {
             event.draw.push();
@@ -1899,7 +2016,7 @@ impl Hooks for VideoScreen {
     }
 
     fn world_primitives(&self, host: &dyn Host, event: &mut WorldPrimitivesEvent<'_>) {
-        let state = self.0.lock().unwrap();
+        let state = self.state();
         let Some(screen) = &state.screen else { return };
 
         let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
@@ -2047,7 +2164,7 @@ impl Hooks for VideoScreen {
                 event.primitives.filled_box(min, max, color).through_walls = true;
                 event.primitives.box_outline(min, max, 0xFFFFFFFF, 2.0).through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], &format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
                 } else if hovered {
                     event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить размер]", 0xFFFFFF00, 0.85).through_walls = true;
                 }
@@ -2070,7 +2187,7 @@ impl Hooks for VideoScreen {
                 event.primitives.filled_box(min, max, color).through_walls = true;
                 event.primitives.box_outline(min, max, 0xFFFFFFFF, 1.5).through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], &format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
                 } else if hovered {
                     event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить пропорции]", 0xFFFFFF00, 0.85).through_walls = true;
                 }
@@ -2126,7 +2243,7 @@ impl Hooks for VideoScreen {
                 event.primitives.filled_box(min, max, color).through_walls = true;
                 event.primitives.box_outline(min, max, 0xFFFFFFFF, 2.0).through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], &format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
                 } else if hovered {
                     event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить размер]", 0xFFFFFF00, 0.85).through_walls = true;
                 }
@@ -2149,7 +2266,7 @@ impl Hooks for VideoScreen {
                 event.primitives.filled_box(min, max, color).through_walls = true;
                 event.primitives.box_outline(min, max, 0xFFFFFFFF, 1.5).through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], &format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
                 } else if hovered {
                     event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить пропорции]", 0xFFFFFF00, 0.85).through_walls = true;
                 }
@@ -2197,7 +2314,7 @@ impl Hooks for VideoScreen {
     }
 
     fn visuals(&self, host: &dyn Host, event: &mut VisualsEvent<'_>) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
         if !state.light_enabled || state.light_brightness <= 0.001 {
             return;
         }
@@ -2303,10 +2420,7 @@ impl Hooks for VideoScreen {
             vec![(height as f64 * 0.45, 1.0)]
         };
 
-        let light_radius = (screen_diagonal * 1.5)
-            .max(width * 1.2)
-            .max(24.0)
-            .min(64.0);
+        let light_radius = (screen_diagonal * 1.5).max(width * 1.2).clamp(24.0, 64.0);
 
         let norm_factor = if is_tall { 2.4 } else { 1.8 };
         let base_light_intensity = (intensity / norm_factor).clamp(0.01, 1.0);
@@ -2385,7 +2499,7 @@ impl Hooks for VideoScreen {
     }
 
     fn screen_render_post(&self, _host: &dyn Host, event: &mut ScreenRenderPostEvent<'_>) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
         state.screen_size = [event.screen.rect[2], event.screen.rect[3]];
         state.chat_open = event.screen.id == "chat";
     }
@@ -2398,7 +2512,7 @@ impl Hooks for VideoScreen {
         if event.button != 0 {
             return Flow::Continue;
         }
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
         let Some(screen) = &state.screen else {
             return Flow::Continue;
         };
@@ -2407,12 +2521,11 @@ impl Hooks for VideoScreen {
         };
         let gui_size = [event.screen.rect[2], event.screen.rect[3]];
 
-        if let Some((handle, _)) = Self::find_hit_handle(screen, &camera, event.screen.mouse, gui_size) {
-            if let Some(editing) = state.editing.as_mut() {
+        if let Some((handle, _)) = Self::find_hit_handle(screen, &camera, event.screen.mouse, gui_size)
+            && let Some(editing) = state.editing.as_mut() {
                 editing.active_handle = Some(handle);
                 return Flow::Cancel;
             }
-        }
         Flow::Continue
     }
 
@@ -2421,7 +2534,7 @@ impl Hooks for VideoScreen {
         host: &mut dyn Host,
         event: &mut ScreenMouseDraggedPreV2Event<'_>,
     ) -> Flow {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
         let Some(editing) = &state.editing else {
             return Flow::Continue;
         };
@@ -2453,20 +2566,18 @@ impl Hooks for VideoScreen {
         if event.button != 0 {
             return Flow::Continue;
         }
-        let mut state = self.0.lock().unwrap();
-        if let Some(editing) = state.editing.as_mut() {
-            if editing.active_handle.take().is_some() {
+        let mut state = self.state();
+        if let Some(editing) = state.editing.as_mut()
+            && editing.active_handle.take().is_some() {
                 return Flow::Cancel;
             }
-        }
         Flow::Continue
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn hooks() -> Box<dyn Hooks> {
     let state = State {
-        saved_screens: load_saved_screens(),
         demo: std::env::var("HORIZON_VIDEO_DEMO").ok(),
         ..State::default()
     };

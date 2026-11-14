@@ -22,9 +22,8 @@
 //!   `/video volume <0-100>`, `/video close`, `/video info`.
 
 use horizon_client::mod_api::{
-    ClickEvent, ClientLevelUnloadEvent, CommandEvent, CommandsEvent, Flow, FrameEvent, Hooks,
-    Host, NativeCamera,
-    NativeColoredLight, NativeHit, PrimitiveShape, ScreenMouseButtonPressedPreEvent,
+    ClickEvent, ClientLevelUnloadEvent, CommandEvent, CommandsEvent, Flow, FrameEvent, Hooks, Host,
+    NativeCamera, NativeColoredLight, NativeHit, PrimitiveShape, ScreenMouseButtonPressedPreEvent,
     ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreV2Event, ScreenRenderPostEvent, Style,
     Text, VisualsEvent, WorldPrimitivesEvent, WorldSubmitEvent, serde_json,
 };
@@ -34,6 +33,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 const SCREENS_FILE: &str = "video_screens.json";
+/// The video surface's size in pixels: 4K, the largest a video slot takes.
+const VIDEO_SIZE: (u32, u32) = (3840, 2160);
 /// The mod's id, as the mixer keys its audio sources by.
 const MOD_ID: &str = "horizon_video";
 /// The sample rate when the game does not say (`video_audio_rate`).
@@ -70,9 +71,10 @@ impl AspectRatio {
                 return Some(Self::Ratio(w / h));
             }
         } else if let Ok(val) = s.parse::<f32>()
-            && val > 0.0 {
-                return Some(Self::Ratio(val));
-            }
+            && val > 0.0
+        {
+            return Some(Self::Ratio(val));
+        }
         None
     }
 
@@ -80,9 +82,10 @@ impl AspectRatio {
         match self {
             Self::Auto => {
                 if let Some((w, h)) = native_size
-                    && h > 0 {
-                        return w as f32 / h as f32;
-                    }
+                    && h > 0
+                {
+                    return w as f32 / h as f32;
+                }
                 DEFAULT_ASPECT
             }
             Self::Ratio(r) => *r,
@@ -385,16 +388,41 @@ impl SpeakerLayout {
         // Back Right: rear room wall
         let mut br = pt(hw + 0.8, 1.7, room_depth * 0.95);
 
-        if let Some(&p) = custom.get(&SpeakerId::FL) { fl = p; }
-        if let Some(&p) = custom.get(&SpeakerId::FR) { fr = p; }
-        if let Some(&p) = custom.get(&SpeakerId::C) { c = p; }
-        if let Some(&p) = custom.get(&SpeakerId::LFE) { lfe = p; }
-        if let Some(&p) = custom.get(&SpeakerId::SL) { sl = p; }
-        if let Some(&p) = custom.get(&SpeakerId::SR) { sr = p; }
-        if let Some(&p) = custom.get(&SpeakerId::BL) { bl = p; }
-        if let Some(&p) = custom.get(&SpeakerId::BR) { br = p; }
+        if let Some(&p) = custom.get(&SpeakerId::FL) {
+            fl = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::FR) {
+            fr = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::C) {
+            c = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::LFE) {
+            lfe = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::SL) {
+            sl = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::SR) {
+            sr = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::BL) {
+            bl = p;
+        }
+        if let Some(&p) = custom.get(&SpeakerId::BR) {
+            br = p;
+        }
 
-        Self { fl, fr, c, lfe, sl, sr, bl, br }
+        Self {
+            fl,
+            fr,
+            c,
+            lfe,
+            sl,
+            sr,
+            bl,
+            br,
+        }
     }
 }
 
@@ -529,8 +557,7 @@ fn save_saved_screens(state: &State) -> Result<(), String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
     }
-    std::fs::write(&path, json)
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    std::fs::write(&path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -573,9 +600,11 @@ impl AudioJob {
                 // FL, FR, FC, LFE, BL, BR, SL, SR
                 Some(ch) => (
                     Vec::from(ch),
-                    [spk.fl, spk.fr, spk.c, spk.lfe, spk.bl, spk.br, spk.sl, spk.sr]
-                        .map(Some)
-                        .to_vec(),
+                    [
+                        spk.fl, spk.fr, spk.c, spk.lfe, spk.bl, spk.br, spk.sl, spk.sr,
+                    ]
+                    .map(Some)
+                    .to_vec(),
                 ),
                 None => return,
             },
@@ -652,20 +681,21 @@ impl VideoScreen {
         // Automatic aspect ratio detection from video stream metadata
         if let Some(screen) = state.screen.as_mut()
             && screen.aspect == AspectRatio::Auto
-                && let Some(video) = screen.video
-                    && let Some(native_size) = host.video_state(video).and_then(|s| s.video_size)
-                        && Some(native_size) != screen.applied_native_size {
-                            screen.recalculate(Some(native_size));
-                            let (w, h) = screen.dimensions(Some(native_size));
-                            let (nw, nh) = native_size;
-                            host.log(
+            && let Some(video) = screen.video
+            && let Some(native_size) = host.video_state(video).and_then(|s| s.video_size)
+            && Some(native_size) != screen.applied_native_size
+        {
+            screen.recalculate(Some(native_size));
+            let (w, h) = screen.dimensions(Some(native_size));
+            let (nw, nh) = native_size;
+            host.log(
                                 "info",
                                 &format!(
                                     "video: auto-detected video stream resolution {}x{} -> screen adjusted to {:.2}x{:.2} blocks",
                                     nw, nh, w, h
                                 ),
                             );
-                        }
+        }
 
         // The video's sound for the game's mixer: what to take is decided
         // here, the taking and playing happen once the lock is let go.
@@ -684,7 +714,13 @@ impl VideoScreen {
             audio = Some(AudioJob {
                 video,
                 mode: state.audio_mode,
-                speakers: SpeakerLayout::compute(screen.at, screen.yaw, w, h, &screen.custom_speakers),
+                speakers: SpeakerLayout::compute(
+                    screen.at,
+                    screen.yaw,
+                    w,
+                    h,
+                    &screen.custom_speakers,
+                ),
                 elapsed,
             });
         }
@@ -704,7 +740,10 @@ impl VideoScreen {
         let camera_opt = host.camera();
         if let (Some(camera), Some(screen)) = (camera_opt.as_ref(), state.screen.as_mut()) {
             let ray_dir = Self::crosshair_ray(camera);
-            let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
+            let native_size = screen
+                .video
+                .and_then(|v| host.video_state(v))
+                .and_then(|s| s.video_size);
 
             if right_down {
                 if !prev_right_down && active_drag.is_none() {
@@ -717,8 +756,17 @@ impl VideoScreen {
                 if let Some(active) = active_drag {
                     match active {
                         DragTarget::Handle(handle) => {
-                            if let Some((u, v)) = Self::ray_intersect_screen_plane(screen, camera.position, ray_dir) {
-                                Self::apply_drag(screen, handle, u as f32, v as f32, native_size, grid_snap);
+                            if let Some((u, v)) =
+                                Self::ray_intersect_screen_plane(screen, camera.position, ray_dir)
+                            {
+                                Self::apply_drag(
+                                    screen,
+                                    handle,
+                                    u as f32,
+                                    v as f32,
+                                    native_size,
+                                    grid_snap,
+                                );
                             }
                         }
                         DragTarget::Speaker(spk_id, dist) => {
@@ -809,14 +857,14 @@ impl VideoScreen {
         audio
     }
 
-
     fn open(&self, host: &mut dyn Host, state: &mut State, path: &str) -> Result<(), String> {
         let camera = host.camera().ok_or("no world is shown yet")?;
-        let video = host.video_open(path, 1280, 720, true)?;
+        let video = host.video_open(path, VIDEO_SIZE.0, VIDEO_SIZE.1, true)?;
         if let Some(old) = state.screen.take()
-            && let Some(v) = old.video {
-                stop_video(host, v);
-            }
+            && let Some(v) = old.video
+        {
+            stop_video(host, v);
+        }
         state.screen = Some(Screen::new(Some(video), camera.position, camera.yaw));
         Ok(())
     }
@@ -828,17 +876,21 @@ impl VideoScreen {
         saved: &SavedScreen,
         path: &str,
     ) -> Result<(), String> {
-        let video = host.video_open(path, 1280, 720, true)?;
+        let video = host.video_open(path, VIDEO_SIZE.0, VIDEO_SIZE.1, true)?;
         if let Some(old) = state.screen.take()
-            && let Some(v) = old.video {
-                stop_video(host, v);
-            }
+            && let Some(v) = old.video
+        {
+            stop_video(host, v);
+        }
         state.screen = Some(Screen::from_saved(saved, Some(video)));
         Ok(())
     }
 
     fn info(host: &dyn Host, screen: &Screen) -> String {
-        let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
+        let native_size = screen
+            .video
+            .and_then(|v| host.video_state(v))
+            .and_then(|s| s.video_size);
         let (w, h) = screen.dimensions(native_size);
         let aspect_mode = match screen.aspect {
             AspectRatio::Auto => format!("auto ({:.2})", screen.aspect.value(native_size)),
@@ -849,7 +901,10 @@ impl VideoScreen {
         } else {
             "".to_string()
         };
-        let size_str = format!("{:.2}x{:.2} blocks (diag {:.2}, aspect {}{})", w, h, screen.diagonal, aspect_mode, curve_str);
+        let size_str = format!(
+            "{:.2}x{:.2} blocks (diag {:.2}, aspect {}{})",
+            w, h, screen.diagonal, aspect_mode, curve_str
+        );
         let video_info = screen.video.and_then(|v| host.video_state(v));
         match video_info {
             Some(s) => format!(
@@ -865,7 +920,10 @@ impl VideoScreen {
                 s.pump_micros,
                 s.upload_micros,
             ),
-            None => format!("screen: size {}, dist {:.1} blk (no video playing)", size_str, screen.distance),
+            None => format!(
+                "screen: size {}, dist {:.1} blk (no video playing)",
+                size_str, screen.distance
+            ),
         }
     }
 
@@ -885,7 +943,10 @@ impl VideoScreen {
         };
 
         host.feedback(Text::colored(
-            format!("§6[Horizon Video] §eРежим настройки экрана: §b{id} §7({:.2}x{:.2} бл{})", w, h, curve_info),
+            format!(
+                "§6[Horizon Video] §eРежим настройки экрана: §b{id} §7({:.2}x{:.2} бл{})",
+                w, h, curve_info
+            ),
             0xFFAA00,
         ));
         host.feedback(Text::colored(
@@ -899,87 +960,123 @@ impl VideoScreen {
 
         // Row 1: Actions & Snapping
         let mut row1 = Text::literal("  ");
-        row1 = row1.append(Text::styled("[💾 Сохранить] ", Style {
-            color: Some(0x55FF55),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand(format!("/video save {id}"))),
-            ..Default::default()
-        }));
-        row1 = row1.append(Text::styled("[🧲 К стене] ", Style {
-            color: Some(0xFFAA00),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video snap wall".into())),
-            ..Default::default()
-        }));
-        row1 = row1.append(Text::styled("[📐 0°] ", Style {
-            color: Some(0xAAAAAA),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video curve 0".into())),
-            ..Default::default()
-        }));
-        row1 = row1.append(Text::styled("[📐 30°] ", Style {
-            color: Some(0xFFFF55),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video curve 30".into())),
-            ..Default::default()
-        }));
-        row1 = row1.append(Text::styled("[📐 60°] ", Style {
-            color: Some(0xFFFF55),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video curve 60".into())),
-            ..Default::default()
-        }));
-        row1 = row1.append(Text::styled("[❌ Закрыть]", Style {
-            color: Some(0xFF5555),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video cancel".into())),
-            ..Default::default()
-        }));
+        row1 = row1.append(Text::styled(
+            "[💾 Сохранить] ",
+            Style {
+                color: Some(0x55FF55),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand(format!("/video save {id}"))),
+                ..Default::default()
+            },
+        ));
+        row1 = row1.append(Text::styled(
+            "[🧲 К стене] ",
+            Style {
+                color: Some(0xFFAA00),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video snap wall".into())),
+                ..Default::default()
+            },
+        ));
+        row1 = row1.append(Text::styled(
+            "[📐 0°] ",
+            Style {
+                color: Some(0xAAAAAA),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video curve 0".into())),
+                ..Default::default()
+            },
+        ));
+        row1 = row1.append(Text::styled(
+            "[📐 30°] ",
+            Style {
+                color: Some(0xFFFF55),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video curve 30".into())),
+                ..Default::default()
+            },
+        ));
+        row1 = row1.append(Text::styled(
+            "[📐 60°] ",
+            Style {
+                color: Some(0xFFFF55),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video curve 60".into())),
+                ..Default::default()
+            },
+        ));
+        row1 = row1.append(Text::styled(
+            "[❌ Закрыть]",
+            Style {
+                color: Some(0xFF5555),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video cancel".into())),
+                ..Default::default()
+            },
+        ));
         host.feedback(row1);
 
         // Row 2: Aspect Ratios, Lighting, Audio
         let mut row2 = Text::literal("  §7Пропорции: ");
-        row2 = row2.append(Text::styled("[16:9] ", Style {
-            color: Some(0x55FFFF),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video aspect 16:9".into())),
-            ..Default::default()
-        }));
-        row2 = row2.append(Text::styled("[4:3] ", Style {
-            color: Some(0x55FFFF),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video aspect 4:3".into())),
-            ..Default::default()
-        }));
-        row2 = row2.append(Text::styled("[21:9] ", Style {
-            color: Some(0x55FFFF),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video aspect 21:9".into())),
-            ..Default::default()
-        }));
-        row2 = row2.append(Text::styled("[1:1] ", Style {
-            color: Some(0x55FFFF),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video aspect 1:1".into())),
-            ..Default::default()
-        }));
-        row2 = row2.append(Text::styled("[Auto]", Style {
-            color: Some(0xFFFF55),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video aspect auto".into())),
-            ..Default::default()
-        }));
+        row2 = row2.append(Text::styled(
+            "[16:9] ",
+            Style {
+                color: Some(0x55FFFF),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video aspect 16:9".into())),
+                ..Default::default()
+            },
+        ));
+        row2 = row2.append(Text::styled(
+            "[4:3] ",
+            Style {
+                color: Some(0x55FFFF),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video aspect 4:3".into())),
+                ..Default::default()
+            },
+        ));
+        row2 = row2.append(Text::styled(
+            "[21:9] ",
+            Style {
+                color: Some(0x55FFFF),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video aspect 21:9".into())),
+                ..Default::default()
+            },
+        ));
+        row2 = row2.append(Text::styled(
+            "[1:1] ",
+            Style {
+                color: Some(0x55FFFF),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video aspect 1:1".into())),
+                ..Default::default()
+            },
+        ));
+        row2 = row2.append(Text::styled(
+            "[Auto]",
+            Style {
+                color: Some(0xFFFF55),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video aspect auto".into())),
+                ..Default::default()
+            },
+        ));
         let (light_text, light_col, light_cmd) = if light_enabled {
             (" [💡 Свет: Вкл]", 0xFFFF55, "/video light off")
         } else {
             (" [💡 Свет: Выкл]", 0x888888, "/video light on")
         };
-        row2 = row2.append(Text::styled(light_text, Style {
-            color: Some(light_col),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand(light_cmd.into())),
-            ..Default::default()
-        }));
+        row2 = row2.append(Text::styled(
+            light_text,
+            Style {
+                color: Some(light_col),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand(light_cmd.into())),
+                ..Default::default()
+            },
+        ));
 
         let (audio_text, audio_col, audio_cmd) = match audio_mode {
             AudioMode::Game3D => (" [🔊 3D]", 0x55FF55, "/video audio stereo"),
@@ -989,24 +1086,30 @@ impl VideoScreen {
             AudioMode::Direct => (" [🔊 Direct]", 0xFFFF55, "/video audio mute"),
             AudioMode::Mute => (" [🔇 Выкл]", 0xFF5555, "/video audio 3d"),
         };
-        row2 = row2.append(Text::styled(audio_text, Style {
-            color: Some(audio_col),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand(audio_cmd.into())),
-            ..Default::default()
-        }));
+        row2 = row2.append(Text::styled(
+            audio_text,
+            Style {
+                color: Some(audio_col),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand(audio_cmd.into())),
+                ..Default::default()
+            },
+        ));
 
         let (speakers_text, speakers_col) = if show_speakers {
             (" [🔈 Колонки: ВКЛ]", 0x55FF55)
         } else {
             (" [🔈 Колонки: ВЫКЛ]", 0x888888)
         };
-        row2 = row2.append(Text::styled(speakers_text, Style {
-            color: Some(speakers_col),
-            bold: Some(true),
-            click: Some(ClickEvent::RunCommand("/video speakers".into())),
-            ..Default::default()
-        }));
+        row2 = row2.append(Text::styled(
+            speakers_text,
+            Style {
+                color: Some(speakers_col),
+                bold: Some(true),
+                click: Some(ClickEvent::RunCommand("/video speakers".into())),
+                ..Default::default()
+            },
+        ));
         host.feedback(row2);
     }
 
@@ -1023,7 +1126,12 @@ impl VideoScreen {
         let d_down = (hit.y - by).abs();
         let d_up = (hit.y - (by + 1.0)).abs();
 
-        let min_d = d_west.min(d_east).min(d_north).min(d_south).min(d_down).min(d_up);
+        let min_d = d_west
+            .min(d_east)
+            .min(d_north)
+            .min(d_south)
+            .min(d_down)
+            .min(d_up);
         let offset = 0.02; // Small gap to prevent z-fighting with block surface
 
         let (normal, yaw, face_name) = if min_d == d_west {
@@ -1036,9 +1144,17 @@ impl VideoScreen {
             ([0.0, 0.0, 1.0], 180.0, "южная стена (South)")
         } else if min_d == d_up {
             // Looking at floor: place facing player's horizontal yaw
-            ([0.0, 1.0, 0.0], (camera.yaw / 90.0).round() * 90.0, "пол (Floor)")
+            (
+                [0.0, 1.0, 0.0],
+                (camera.yaw / 90.0).round() * 90.0,
+                "пол (Floor)",
+            )
         } else {
-            ([0.0, -1.0, 0.0], (camera.yaw / 90.0).round() * 90.0, "потолок (Ceiling)")
+            (
+                [0.0, -1.0, 0.0],
+                (camera.yaw / 90.0).round() * 90.0,
+                "потолок (Ceiling)",
+            )
         };
 
         screen.yaw = yaw;
@@ -1064,7 +1180,10 @@ impl VideoScreen {
         screen.camera_pos = camera.position;
         screen.recalculate(screen.applied_native_size);
 
-        format!("блок {} [{:.0}, {:.0}, {:.0}] - {}", hit.block, bx, by, bz, face_name)
+        format!(
+            "блок {} [{:.0}, {:.0}, {:.0}] - {}",
+            hit.block, bx, by, bz, face_name
+        )
     }
 
     fn raycast_screen_plane(
@@ -1123,7 +1242,8 @@ impl VideoScreen {
         let norm_y = 0.0;
         let norm_z = f64::from(-scr_cos);
 
-        let denom = f64::from(dir_x) * norm_x + f64::from(dir_y) * norm_y + f64::from(dir_z) * norm_z;
+        let denom =
+            f64::from(dir_x) * norm_x + f64::from(dir_y) * norm_y + f64::from(dir_z) * norm_z;
         if denom >= -1e-4 {
             return None;
         }
@@ -1227,6 +1347,25 @@ impl VideoScreen {
         (dist_sq.sqrt(), t)
     }
 
+    pub fn is_screen_visible(
+        camera: &NativeCamera,
+        screen_center: [f64; 3],
+        screen_radius: f64,
+    ) -> bool {
+        let dx = screen_center[0] - camera.position[0];
+        let dy = screen_center[1] - camera.position[1];
+        let dz = screen_center[2] - camera.position[2];
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+        if dist_sq <= screen_radius * screen_radius {
+            return true;
+        }
+        let dist = dist_sq.sqrt();
+        let ray = Self::crosshair_ray(camera);
+        let dot = (dx * ray[0] + dy * ray[1] + dz * ray[2]) / dist;
+        let angular_radius = (screen_radius / dist).min(1.0);
+        dot + angular_radius >= 0.05
+    }
+
     pub fn ray_intersect_screen_plane(
         screen: &Screen,
         cam_pos: [f64; 3],
@@ -1264,11 +1403,7 @@ impl VideoScreen {
             cam_pos[2] + t * ray_dir[2],
         ];
 
-        let rel = [
-            hit[0] - center[0],
-            hit[1] - center[1],
-            hit[2] - center[2],
-        ];
+        let rel = [hit[0] - center[0], hit[1] - center[1], hit[2] - center[2]];
 
         let scr_r = [f64::from(-scr_cos), 0.0, f64::from(-scr_sin)];
         let u = rel[0] * scr_r[0] + rel[1] * scr_r[1] + rel[2] * scr_r[2];
@@ -1314,13 +1449,8 @@ impl VideoScreen {
                     (SpeakerId::SL, spk.sl),
                     (SpeakerId::SR, spk.sr),
                 ],
-                AudioMode::StereoSpeakers => &[
-                    (SpeakerId::FL, spk.fl),
-                    (SpeakerId::FR, spk.fr),
-                ],
-                AudioMode::Game3D => &[
-                    (SpeakerId::C, spk.c),
-                ],
+                AudioMode::StereoSpeakers => &[(SpeakerId::FL, spk.fl), (SpeakerId::FR, spk.fr)],
+                AudioMode::Game3D => &[(SpeakerId::C, spk.c)],
                 AudioMode::Direct | AudioMode::Mute => &[],
             };
 
@@ -1351,37 +1481,38 @@ impl VideoScreen {
                 ]
             };
 
-            let (tl, tr, bl, br, edge_top, edge_bot, edge_left, edge_right) = if screen.curvature <= 0.5 {
-                (
-                    point_at(-hw, hh, 0.0),
-                    point_at(hw, hh, 0.0),
-                    point_at(-hw, -hh, 0.0),
-                    point_at(hw, -hh, 0.0),
-                    point_at(0.0, hh, 0.0),
-                    point_at(0.0, -hh, 0.0),
-                    point_at(-hw, 0.0, 0.0),
-                    point_at(hw, 0.0, 0.0),
-                )
-            } else {
-                let alpha = f64::from(screen.curvature).to_radians();
-                let radius = f64::from(w) / alpha;
-                let arc_pt = |f: f64, y: f64| -> [f64; 3] {
-                    let theta = -alpha * 0.5 + alpha * f;
-                    let x = radius * theta.sin();
-                    let z = radius * (1.0 - theta.cos());
-                    point_at(x, y, z)
+            let (tl, tr, bl, br, edge_top, edge_bot, edge_left, edge_right) =
+                if screen.curvature <= 0.5 {
+                    (
+                        point_at(-hw, hh, 0.0),
+                        point_at(hw, hh, 0.0),
+                        point_at(-hw, -hh, 0.0),
+                        point_at(hw, -hh, 0.0),
+                        point_at(0.0, hh, 0.0),
+                        point_at(0.0, -hh, 0.0),
+                        point_at(-hw, 0.0, 0.0),
+                        point_at(hw, 0.0, 0.0),
+                    )
+                } else {
+                    let alpha = f64::from(screen.curvature).to_radians();
+                    let radius = f64::from(w) / alpha;
+                    let arc_pt = |f: f64, y: f64| -> [f64; 3] {
+                        let theta = -alpha * 0.5 + alpha * f;
+                        let x = radius * theta.sin();
+                        let z = radius * (1.0 - theta.cos());
+                        point_at(x, y, z)
+                    };
+                    (
+                        arc_pt(0.0, hh),
+                        arc_pt(1.0, hh),
+                        arc_pt(0.0, -hh),
+                        arc_pt(1.0, -hh),
+                        arc_pt(0.5, hh),
+                        arc_pt(0.5, -hh),
+                        arc_pt(0.0, 0.0),
+                        arc_pt(1.0, 0.0),
+                    )
                 };
-                (
-                    arc_pt(0.0, hh),
-                    arc_pt(1.0, hh),
-                    arc_pt(0.0, -hh),
-                    arc_pt(1.0, -hh),
-                    arc_pt(0.5, hh),
-                    arc_pt(0.5, -hh),
-                    arc_pt(0.0, 0.0),
-                    arc_pt(1.0, 0.0),
-                )
-            };
 
             let handle_list = [
                 (DragHandle::CornerTL, tl),
@@ -1945,7 +2076,10 @@ impl Hooks for VideoScreen {
         match (&done, &state.screen) {
             (Ok(()), Some(screen)) => match verb {
                 "size" | "grow" | "shrink" | "aspect" => {
-                    let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|st| st.video_size);
+                    let native_size = screen
+                        .video
+                        .and_then(|v| host.video_state(v))
+                        .and_then(|st| st.video_size);
                     let (w, h) = screen.dimensions(native_size);
                     host.log(
                         "info",
@@ -1962,10 +2096,7 @@ impl Hooks for VideoScreen {
                     );
                 }
                 "reset" => {
-                    host.log(
-                        "info",
-                        "video: screen reset to default size and distance",
-                    );
+                    host.log("info", "video: screen reset to default size and distance");
                 }
                 "info" => host.log("info", &Self::info(host, screen)),
                 _ => {}
@@ -2000,6 +2131,14 @@ impl Hooks for VideoScreen {
         let state = self.state();
         let Some(screen) = &state.screen else { return };
         if let Some(video) = screen.video {
+            if let Some(camera) = host.camera() {
+                let (w, h) = screen.dimensions(screen.applied_native_size);
+                let center = [screen.at[0], screen.at[1] + h as f64 * 0.5, screen.at[2]];
+                let radius = (screen.diagonal as f64 * 0.6).max(w as f64 * 0.6);
+                if !Self::is_screen_visible(&camera, center, radius) {
+                    return;
+                }
+            }
             event.draw.push();
             if event.draw.translate_world(screen.at) {
                 if screen.curvature <= 0.5 {
@@ -2019,7 +2158,10 @@ impl Hooks for VideoScreen {
         let state = self.state();
         let Some(screen) = &state.screen else { return };
 
-        let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
+        let native_size = screen
+            .video
+            .and_then(|v| host.video_state(v))
+            .and_then(|s| s.video_size);
         let (w, h) = screen.dimensions(native_size);
 
         // Draw 3D Surround Speakers in world when editing or when speaker visualization is toggled on
@@ -2031,64 +2173,143 @@ impl Hooks for VideoScreen {
             let is_spk_hovered = |id: SpeakerId| -> bool {
                 matches!(state.hovered_target, Some(DragTarget::Speaker(spk_id, _)) if spk_id == id)
             };
-            let mut draw_spk = |id: SpeakerId, pos: [f64; 3], label: &str, color: u32, is_sub: bool| {
-                let active = is_spk_active(id);
-                let hovered = is_spk_hovered(id);
-                let sz = if active {
-                    if is_sub { 0.30 } else { 0.22 }
-                } else if hovered {
-                    if is_sub { 0.26 } else { 0.19 }
-                } else {
-                    if is_sub { 0.22 } else { 0.16 }
-                };
-                let (outline_col, outline_w) = if active {
-                    (0xFF55FF55, 4.0)
-                } else if hovered {
-                    (0xFFFFFF00, 3.5)
-                } else {
-                    (color, 2.0)
-                };
+            let mut draw_spk =
+                |id: SpeakerId, pos: [f64; 3], label: &str, color: u32, is_sub: bool| {
+                    let active = is_spk_active(id);
+                    let hovered = is_spk_hovered(id);
+                    let sz = if active {
+                        if is_sub { 0.30 } else { 0.22 }
+                    } else if hovered {
+                        if is_sub { 0.26 } else { 0.19 }
+                    } else {
+                        if is_sub { 0.22 } else { 0.16 }
+                    };
+                    let (outline_col, outline_w) = if active {
+                        (0xFF55FF55, 4.0)
+                    } else if hovered {
+                        (0xFFFFFF00, 3.5)
+                    } else {
+                        (color, 2.0)
+                    };
 
-                let min = [pos[0] - sz, pos[1] - sz, pos[2] - sz];
-                let max = [pos[0] + sz, pos[1] + sz, pos[2] + sz];
-                event.primitives.box_outline(min, max, outline_col, outline_w).through_walls = true;
-                if active || hovered {
-                    event.primitives.filled_box(min, max, (outline_col & 0x00FFFFFF) | 0x35000000).through_walls = true;
-                }
-                event.primitives.line(screen.at, pos, (outline_col & 0x00FFFFFF) | 0x35000000, 1.0).through_walls = true;
-                let text_pos = [pos[0], pos[1] + sz + 0.15, pos[2]];
-                let text = if active {
-                    format!("§a[Тяните {}] ({:.1}, {:.1}, {:.1})", id.name(), pos[0], pos[1], pos[2])
-                } else if hovered {
-                    format!("§e[Зажмите ПКМ: переместить {}]", id.name())
-                } else {
-                    label.to_string()
+                    let min = [pos[0] - sz, pos[1] - sz, pos[2] - sz];
+                    let max = [pos[0] + sz, pos[1] + sz, pos[2] + sz];
+                    event
+                        .primitives
+                        .box_outline(min, max, outline_col, outline_w)
+                        .through_walls = true;
+                    if active || hovered {
+                        event
+                            .primitives
+                            .filled_box(min, max, (outline_col & 0x00FFFFFF) | 0x35000000)
+                            .through_walls = true;
+                    }
+                    event
+                        .primitives
+                        .line(screen.at, pos, (outline_col & 0x00FFFFFF) | 0x35000000, 1.0)
+                        .through_walls = true;
+                    let text_pos = [pos[0], pos[1] + sz + 0.15, pos[2]];
+                    let text = if active {
+                        format!(
+                            "§a[Тяните {}] ({:.1}, {:.1}, {:.1})",
+                            id.name(),
+                            pos[0],
+                            pos[1],
+                            pos[2]
+                        )
+                    } else if hovered {
+                        format!("§e[Зажмите ПКМ: переместить {}]", id.name())
+                    } else {
+                        label.to_string()
+                    };
+                    event
+                        .primitives
+                        .text(text_pos, &text, outline_col, 0.8)
+                        .through_walls = true;
                 };
-                event.primitives.text(text_pos, &text, outline_col, 0.8).through_walls = true;
-            };
 
             match state.audio_mode {
                 AudioMode::Surround71 => {
                     draw_spk(SpeakerId::FL, spk.fl, "[FL] Левый фронт", 0xFF00FFCC, false);
-                    draw_spk(SpeakerId::FR, spk.fr, "[FR] Правый фронт", 0xFF00FFCC, false);
+                    draw_spk(
+                        SpeakerId::FR,
+                        spk.fr,
+                        "[FR] Правый фронт",
+                        0xFF00FFCC,
+                        false,
+                    );
                     draw_spk(SpeakerId::C, spk.c, "[C] Центр (Голос)", 0xFFFFDD33, false);
                     draw_spk(SpeakerId::LFE, spk.lfe, "[LFE] Сабвуфер", 0xFFFF6600, true);
-                    draw_spk(SpeakerId::SL, spk.sl, "[SL] Боковой левый", 0xFF3399FF, false);
-                    draw_spk(SpeakerId::SR, spk.sr, "[SR] Боковой правый", 0xFF3399FF, false);
-                    draw_spk(SpeakerId::BL, spk.bl, "[BL] Задний левый", 0xFFCC33FF, false);
-                    draw_spk(SpeakerId::BR, spk.br, "[BR] Задний правый", 0xFFCC33FF, false);
+                    draw_spk(
+                        SpeakerId::SL,
+                        spk.sl,
+                        "[SL] Боковой левый",
+                        0xFF3399FF,
+                        false,
+                    );
+                    draw_spk(
+                        SpeakerId::SR,
+                        spk.sr,
+                        "[SR] Боковой правый",
+                        0xFF3399FF,
+                        false,
+                    );
+                    draw_spk(
+                        SpeakerId::BL,
+                        spk.bl,
+                        "[BL] Задний левый",
+                        0xFFCC33FF,
+                        false,
+                    );
+                    draw_spk(
+                        SpeakerId::BR,
+                        spk.br,
+                        "[BR] Задний правый",
+                        0xFFCC33FF,
+                        false,
+                    );
                 }
                 AudioMode::Surround51 => {
                     draw_spk(SpeakerId::FL, spk.fl, "[FL] Левый фронт", 0xFF00FFCC, false);
-                    draw_spk(SpeakerId::FR, spk.fr, "[FR] Правый фронт", 0xFF00FFCC, false);
+                    draw_spk(
+                        SpeakerId::FR,
+                        spk.fr,
+                        "[FR] Правый фронт",
+                        0xFF00FFCC,
+                        false,
+                    );
                     draw_spk(SpeakerId::C, spk.c, "[C] Центр (Голос)", 0xFFFFDD33, false);
                     draw_spk(SpeakerId::LFE, spk.lfe, "[LFE] Сабвуфер", 0xFFFF6600, true);
-                    draw_spk(SpeakerId::SL, spk.sl, "[SL] Тыловой левый", 0xFF3399FF, false);
-                    draw_spk(SpeakerId::SR, spk.sr, "[SR] Тыловой правый", 0xFF3399FF, false);
+                    draw_spk(
+                        SpeakerId::SL,
+                        spk.sl,
+                        "[SL] Тыловой левый",
+                        0xFF3399FF,
+                        false,
+                    );
+                    draw_spk(
+                        SpeakerId::SR,
+                        spk.sr,
+                        "[SR] Тыловой правый",
+                        0xFF3399FF,
+                        false,
+                    );
                 }
                 AudioMode::StereoSpeakers => {
-                    draw_spk(SpeakerId::FL, spk.fl, "[L] Левая колонка", 0xFF00FFCC, false);
-                    draw_spk(SpeakerId::FR, spk.fr, "[R] Правая колонка", 0xFF00FFCC, false);
+                    draw_spk(
+                        SpeakerId::FL,
+                        spk.fl,
+                        "[L] Левая колонка",
+                        0xFF00FFCC,
+                        false,
+                    );
+                    draw_spk(
+                        SpeakerId::FR,
+                        spk.fr,
+                        "[R] Правая колонка",
+                        0xFF00FFCC,
+                        false,
+                    );
                 }
                 AudioMode::Game3D => {
                     draw_spk(SpeakerId::C, spk.c, "[3D] Центр экрана", 0xFF55FF55, false);
@@ -2097,7 +2318,9 @@ impl Hooks for VideoScreen {
             }
         }
 
-        let Some(editing) = &state.editing else { return };
+        let Some(editing) = &state.editing else {
+            return;
+        };
         let hw = f64::from(w) * 0.5;
         let hh = f64::from(h) * 0.5;
 
@@ -2126,8 +2349,15 @@ impl Hooks for VideoScreen {
         let is_handle_hovered = |h: DragHandle| -> bool {
             matches!(state.hovered_target, Some(DragTarget::Handle(handle)) if handle == h)
         };
-        let has_any_active_screen_drag = matches!(state.active_drag, Some(DragTarget::Handle(_) | DragTarget::ScreenCenter { .. }));
-        let wireframe_color = if has_any_active_screen_drag { 0xFF55FF55 } else { 0xFFFF2222 };
+        let has_any_active_screen_drag = matches!(
+            state.active_drag,
+            Some(DragTarget::Handle(_) | DragTarget::ScreenCenter { .. })
+        );
+        let wireframe_color = if has_any_active_screen_drag {
+            0xFF55FF55
+        } else {
+            0xFFFF2222
+        };
 
         if screen.curvature <= 0.5 {
             // Flat screen wireframe
@@ -2137,36 +2367,100 @@ impl Hooks for VideoScreen {
             let bl = point_at(-hw, -hh, 0.0);
 
             // 1. Outer wireframe border
-            event.primitives.line(tl, tr, wireframe_color, 3.0).through_walls = true;
-            event.primitives.line(tr, br, wireframe_color, 3.0).through_walls = true;
-            event.primitives.line(br, bl, wireframe_color, 3.0).through_walls = true;
-            event.primitives.line(bl, tl, wireframe_color, 3.0).through_walls = true;
+            event
+                .primitives
+                .line(tl, tr, wireframe_color, 3.0)
+                .through_walls = true;
+            event
+                .primitives
+                .line(tr, br, wireframe_color, 3.0)
+                .through_walls = true;
+            event
+                .primitives
+                .line(br, bl, wireframe_color, 3.0)
+                .through_walls = true;
+            event
+                .primitives
+                .line(bl, tl, wireframe_color, 3.0)
+                .through_walls = true;
 
             // 2. Interior alignment grid (4x4 subdivisions)
             for i in 1..4 {
                 let f = f64::from(i) / 4.0;
                 let u = -hw + f64::from(w) * f;
-                event.primitives.line(point_at(u, hh, 0.0), point_at(u, -hh, 0.0), (wireframe_color & 0x00FFFFFF) | 0x60000000, 1.5).through_walls = true;
+                event
+                    .primitives
+                    .line(
+                        point_at(u, hh, 0.0),
+                        point_at(u, -hh, 0.0),
+                        (wireframe_color & 0x00FFFFFF) | 0x60000000,
+                        1.5,
+                    )
+                    .through_walls = true;
 
                 let v = -hh + f64::from(h) * f;
-                event.primitives.line(point_at(-hw, v, 0.0), point_at(hw, v, 0.0), (wireframe_color & 0x00FFFFFF) | 0x60000000, 1.5).through_walls = true;
+                event
+                    .primitives
+                    .line(
+                        point_at(-hw, v, 0.0),
+                        point_at(hw, v, 0.0),
+                        (wireframe_color & 0x00FFFFFF) | 0x60000000,
+                        1.5,
+                    )
+                    .through_walls = true;
             }
 
             // 3. Corner handles
             let corner_s = (w.min(h) * 0.035).clamp(0.08, 0.35) as f64;
-            for (handle, p) in [(DragHandle::CornerTL, tl), (DragHandle::CornerTR, tr), (DragHandle::CornerBL, bl), (DragHandle::CornerBR, br)] {
+            for (handle, p) in [
+                (DragHandle::CornerTL, tl),
+                (DragHandle::CornerTR, tr),
+                (DragHandle::CornerBL, bl),
+                (DragHandle::CornerBR, br),
+            ] {
                 let active = is_handle_active(handle);
                 let hovered = is_handle_hovered(handle);
-                let color = if active { 0xFF55FF55 } else if hovered { 0xFFFFFF00 } else { 0xFFFF1111 };
-                let s = if active { corner_s * 1.4 } else if hovered { corner_s * 1.2 } else { corner_s };
+                let color = if active {
+                    0xFF55FF55
+                } else if hovered {
+                    0xFFFFFF00
+                } else {
+                    0xFFFF1111
+                };
+                let s = if active {
+                    corner_s * 1.4
+                } else if hovered {
+                    corner_s * 1.2
+                } else {
+                    corner_s
+                };
                 let min = [p[0] - s, p[1] - s, p[2] - s];
                 let max = [p[0] + s, p[1] + s, p[2] + s];
                 event.primitives.filled_box(min, max, color).through_walls = true;
-                event.primitives.box_outline(min, max, 0xFFFFFFFF, 2.0).through_walls = true;
+                event
+                    .primitives
+                    .box_outline(min, max, 0xFFFFFFFF, 2.0)
+                    .through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h),
+                            0xFF55FF55,
+                            0.85,
+                        )
+                        .through_walls = true;
                 } else if hovered {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить размер]", 0xFFFFFF00, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            "§e[Зажмите ПКМ: изменить размер]",
+                            0xFFFFFF00,
+                            0.85,
+                        )
+                        .through_walls = true;
                 }
             }
 
@@ -2180,16 +2474,47 @@ impl Hooks for VideoScreen {
             ] {
                 let active = is_handle_active(handle);
                 let hovered = is_handle_hovered(handle);
-                let color = if active { 0xFF55FF55 } else if hovered { 0xFFFFFF00 } else { 0xFFFF6622 };
-                let s = if active { edge_s * 1.4 } else if hovered { edge_s * 1.2 } else { edge_s };
+                let color = if active {
+                    0xFF55FF55
+                } else if hovered {
+                    0xFFFFFF00
+                } else {
+                    0xFFFF6622
+                };
+                let s = if active {
+                    edge_s * 1.4
+                } else if hovered {
+                    edge_s * 1.2
+                } else {
+                    edge_s
+                };
                 let min = [p[0] - s, p[1] - s, p[2] - s];
                 let max = [p[0] + s, p[1] + s, p[2] + s];
                 event.primitives.filled_box(min, max, color).through_walls = true;
-                event.primitives.box_outline(min, max, 0xFFFFFFFF, 1.5).through_walls = true;
+                event
+                    .primitives
+                    .box_outline(min, max, 0xFFFFFFFF, 1.5)
+                    .through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h),
+                            0xFF55FF55,
+                            0.85,
+                        )
+                        .through_walls = true;
                 } else if hovered {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить пропорции]", 0xFFFFFF00, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            "§e[Зажмите ПКМ: изменить пропорции]",
+                            0xFFFFFF00,
+                            0.85,
+                        )
+                        .through_walls = true;
                 }
             }
         } else {
@@ -2214,12 +2539,21 @@ impl Hooks for VideoScreen {
                 let bot0 = arc_pt(f0, -hh);
                 let bot1 = arc_pt(f1, -hh);
 
-                event.primitives.line(top0, top1, wireframe_color, 3.0).through_walls = true;
-                event.primitives.line(bot0, bot1, wireframe_color, 3.0).through_walls = true;
+                event
+                    .primitives
+                    .line(top0, top1, wireframe_color, 3.0)
+                    .through_walls = true;
+                event
+                    .primitives
+                    .line(bot0, bot1, wireframe_color, 3.0)
+                    .through_walls = true;
 
                 // Interior vertical ribs (every 6 slices)
                 if i > 0 && i % (n / 4) == 0 {
-                    event.primitives.line(top0, bot0, (wireframe_color & 0x00FFFFFF) | 0x60000000, 1.5).through_walls = true;
+                    event
+                        .primitives
+                        .line(top0, bot0, (wireframe_color & 0x00FFFFFF) | 0x60000000, 1.5)
+                        .through_walls = true;
                 }
             }
 
@@ -2228,24 +2562,66 @@ impl Hooks for VideoScreen {
             let bl = arc_pt(0.0, -hh);
             let tr = arc_pt(1.0, hh);
             let br = arc_pt(1.0, -hh);
-            event.primitives.line(tl, bl, wireframe_color, 3.0).through_walls = true;
-            event.primitives.line(tr, br, wireframe_color, 3.0).through_walls = true;
+            event
+                .primitives
+                .line(tl, bl, wireframe_color, 3.0)
+                .through_walls = true;
+            event
+                .primitives
+                .line(tr, br, wireframe_color, 3.0)
+                .through_walls = true;
 
             // Curved corner handles
             let corner_s = (w.min(h) * 0.035).clamp(0.08, 0.35) as f64;
-            for (handle, p) in [(DragHandle::CornerTL, tl), (DragHandle::CornerTR, tr), (DragHandle::CornerBL, bl), (DragHandle::CornerBR, br)] {
+            for (handle, p) in [
+                (DragHandle::CornerTL, tl),
+                (DragHandle::CornerTR, tr),
+                (DragHandle::CornerBL, bl),
+                (DragHandle::CornerBR, br),
+            ] {
                 let active = is_handle_active(handle);
                 let hovered = is_handle_hovered(handle);
-                let color = if active { 0xFF55FF55 } else if hovered { 0xFFFFFF00 } else { 0xFFFF1111 };
-                let s = if active { corner_s * 1.4 } else if hovered { corner_s * 1.2 } else { corner_s };
+                let color = if active {
+                    0xFF55FF55
+                } else if hovered {
+                    0xFFFFFF00
+                } else {
+                    0xFFFF1111
+                };
+                let s = if active {
+                    corner_s * 1.4
+                } else if hovered {
+                    corner_s * 1.2
+                } else {
+                    corner_s
+                };
                 let min = [p[0] - s, p[1] - s, p[2] - s];
                 let max = [p[0] + s, p[1] + s, p[2] + s];
                 event.primitives.filled_box(min, max, color).through_walls = true;
-                event.primitives.box_outline(min, max, 0xFFFFFFFF, 2.0).through_walls = true;
+                event
+                    .primitives
+                    .box_outline(min, max, 0xFFFFFFFF, 2.0)
+                    .through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            format!("§a[Тяните размер] {:.2}x{:.2} бл", w, h),
+                            0xFF55FF55,
+                            0.85,
+                        )
+                        .through_walls = true;
                 } else if hovered {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить размер]", 0xFFFFFF00, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            "§e[Зажмите ПКМ: изменить размер]",
+                            0xFFFFFF00,
+                            0.85,
+                        )
+                        .through_walls = true;
                 }
             }
 
@@ -2259,16 +2635,47 @@ impl Hooks for VideoScreen {
             ] {
                 let active = is_handle_active(handle);
                 let hovered = is_handle_hovered(handle);
-                let color = if active { 0xFF55FF55 } else if hovered { 0xFFFFFF00 } else { 0xFFFF6622 };
-                let s = if active { edge_s * 1.4 } else if hovered { edge_s * 1.2 } else { edge_s };
+                let color = if active {
+                    0xFF55FF55
+                } else if hovered {
+                    0xFFFFFF00
+                } else {
+                    0xFFFF6622
+                };
+                let s = if active {
+                    edge_s * 1.4
+                } else if hovered {
+                    edge_s * 1.2
+                } else {
+                    edge_s
+                };
                 let min = [p[0] - s, p[1] - s, p[2] - s];
                 let max = [p[0] + s, p[1] + s, p[2] + s];
                 event.primitives.filled_box(min, max, color).through_walls = true;
-                event.primitives.box_outline(min, max, 0xFFFFFFFF, 1.5).through_walls = true;
+                event
+                    .primitives
+                    .box_outline(min, max, 0xFFFFFFFF, 1.5)
+                    .through_walls = true;
                 if active {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h), 0xFF55FF55, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            format!("§a[Тяните пропорции] {:.2}x{:.2} бл", w, h),
+                            0xFF55FF55,
+                            0.85,
+                        )
+                        .through_walls = true;
                 } else if hovered {
-                    event.primitives.text([p[0], p[1] + s + 0.2, p[2]], "§e[Зажмите ПКМ: изменить пропорции]", 0xFFFFFF00, 0.85).through_walls = true;
+                    event
+                        .primitives
+                        .text(
+                            [p[0], p[1] + s + 0.2, p[2]],
+                            "§e[Зажмите ПКМ: изменить пропорции]",
+                            0xFFFFFF00,
+                            0.85,
+                        )
+                        .through_walls = true;
                 }
             }
         }
@@ -2276,41 +2683,86 @@ impl Hooks for VideoScreen {
         // 5. Screen center handle
         let center_active = matches!(state.active_drag, Some(DragTarget::ScreenCenter { .. }));
         let center_hovered = matches!(state.hovered_target, Some(DragTarget::ScreenCenter { .. }));
-        let cs = if center_active { 0.16 } else if center_hovered { 0.12 } else { 0.08 };
-        let ccol = if center_active { 0xFF55FF55 } else if center_hovered { 0xFFFFFF00 } else { 0x80FFFFFF };
+        let cs = if center_active {
+            0.16
+        } else if center_hovered {
+            0.12
+        } else {
+            0.08
+        };
+        let ccol = if center_active {
+            0xFF55FF55
+        } else if center_hovered {
+            0xFFFFFF00
+        } else {
+            0x80FFFFFF
+        };
         let min = [center[0] - cs, center[1] - cs, center[2] - cs];
         let max = [center[0] + cs, center[1] + cs, center[2] + cs];
         event.primitives.filled_box(min, max, ccol).through_walls = true;
-        event.primitives.box_outline(min, max, 0xFFFFFFFF, 1.5).through_walls = true;
+        event
+            .primitives
+            .box_outline(min, max, 0xFFFFFFFF, 1.5)
+            .through_walls = true;
         if center_active {
-            event.primitives.text([center[0], center[1] + 0.35, center[2]], "§a[Тяните: перемещение экрана]", 0xFF55FF55, 0.85).through_walls = true;
+            event
+                .primitives
+                .text(
+                    [center[0], center[1] + 0.35, center[2]],
+                    "§a[Тяните: перемещение экрана]",
+                    0xFF55FF55,
+                    0.85,
+                )
+                .through_walls = true;
         } else if center_hovered {
-            event.primitives.text([center[0], center[1] + 0.35, center[2]], "§e[Зажмите ПКМ: переместить экран]", 0xFFFFFF00, 0.85).through_walls = true;
+            event
+                .primitives
+                .text(
+                    [center[0], center[1] + 0.35, center[2]],
+                    "§e[Зажмите ПКМ: переместить экран]",
+                    0xFFFFFF00,
+                    0.85,
+                )
+                .through_walls = true;
         }
 
         // Overhead floating label
         let label_pos = point_at(0.0, hh + 0.35, 0.0);
         let id_str = &editing.id;
         let aspect_str = screen.aspect.as_string();
-        let curve_label = if screen.curvature > 0.5 { format!(" | изгиб {:.0}°", screen.curvature) } else { "".into() };
-        event.primitives.push(PrimitiveShape::Text {
-            at: label_pos,
-            text: format!("[{}: {:.2}x{:.2} бл | {}{}]", id_str, w, h, aspect_str, curve_label),
-            color: 0xFFFFFFFF,
-            scale: 1.0,
-            scale_with_distance: false,
-            background: true,
-        }).through_walls = true;
+        let curve_label = if screen.curvature > 0.5 {
+            format!(" | изгиб {:.0}°", screen.curvature)
+        } else {
+            "".into()
+        };
+        event
+            .primitives
+            .push(PrimitiveShape::Text {
+                at: label_pos,
+                text: format!(
+                    "[{}: {:.2}x{:.2} бл | {}{}]",
+                    id_str, w, h, aspect_str, curve_label
+                ),
+                color: 0xFFFFFFFF,
+                scale: 1.0,
+                scale_with_distance: false,
+                background: true,
+            })
+            .through_walls = true;
 
         let hint_pos = point_at(0.0, hh + 0.70, 0.0);
-        event.primitives.push(PrimitiveShape::Text {
-            at: hint_pos,
-            text: "§e[Наведите прицел на угол или колонку и зажмите ПКМ, чтобы двигать в 3D]".into(),
-            color: 0xFFFFFF55,
-            scale: 0.85,
-            scale_with_distance: false,
-            background: true,
-        }).through_walls = true;
+        event
+            .primitives
+            .push(PrimitiveShape::Text {
+                at: hint_pos,
+                text: "§e[Наведите прицел на угол или колонку и зажмите ПКМ, чтобы двигать в 3D]"
+                    .into(),
+                color: 0xFFFFFF55,
+                scale: 0.85,
+                scale_with_distance: false,
+                background: true,
+            })
+            .through_walls = true;
     }
 
     fn visuals(&self, host: &dyn Host, event: &mut VisualsEvent<'_>) {
@@ -2329,6 +2781,19 @@ impl Hooks for VideoScreen {
         let screen_diagonal = screen.diagonal;
         let screen_curvature = screen.curvature;
         let (width, height) = screen.dimensions(screen.applied_native_size);
+
+        let Some(camera) = host.camera() else {
+            return;
+        };
+        let center = [
+            screen_at[0],
+            screen_at[1] + height as f64 * 0.5,
+            screen_at[2],
+        ];
+        let screen_radius = (screen_diagonal as f64 * 0.6).max(width as f64 * 0.6);
+        if !Self::is_screen_visible(&camera, center, screen_radius) {
+            return;
+        }
 
         let Some(color) = host.video_color(video) else {
             return;
@@ -2359,10 +2824,12 @@ impl Hooks for VideoScreen {
 
             // Perceptual intensity with gamma response (lum^0.5)
             let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-            let target_intensity = (lum.sqrt() * (top / 255.0) * state.light_brightness).clamp(0.0, 1.0);
+            let target_intensity =
+                (lum.sqrt() * (top / 255.0) * state.light_brightness).clamp(0.0, 1.0);
 
             // Responsive exponential smoothing
-            let diff = (target_rgb[0] - state.current_light_rgb[0]).abs()
+            let diff = (target_rgb[0] - state.current_light_rgb[0])
+                .abs()
                 .max((target_rgb[1] - state.current_light_rgb[1]).abs())
                 .max((target_rgb[2] - state.current_light_rgb[2]).abs());
             let int_diff = (target_intensity - state.current_light_intensity).abs();
@@ -2376,7 +2843,8 @@ impl Hooks for VideoScreen {
             state.current_light_rgb[0] += (target_rgb[0] - state.current_light_rgb[0]) * alpha;
             state.current_light_rgb[1] += (target_rgb[1] - state.current_light_rgb[1]) * alpha;
             state.current_light_rgb[2] += (target_rgb[2] - state.current_light_rgb[2]) * alpha;
-            state.current_light_intensity += (target_intensity - state.current_light_intensity) * alpha;
+            state.current_light_intensity +=
+                (target_intensity - state.current_light_intensity) * alpha;
         }
 
         let intensity = state.current_light_intensity;
@@ -2406,95 +2874,83 @@ impl Hooks for VideoScreen {
             pack_rgb(br / top * 255.0, bg / top * 255.0, bb / top * 255.0)
         };
 
-        // Screen area light simulation: distribute lights across the screen surface
-        // to produce a smooth, continuous, uniform ambient wash without localized hotspots.
-        let is_tall = height >= 3.0;
-        let n_cols: usize = if is_tall { 6 } else { 7 };
-        let rows: Vec<(f64, f32)> = if is_tall {
-            // Lower row near floor and upper row for ceiling/room depth
-            vec![
-                ((height as f64 * 0.10).max(0.4), 1.15),
-                (height as f64 * 0.60, 0.85),
-            ]
+        let center_y = screen_at[1] + height as f64 * 0.5;
+        let base_radius = (screen_diagonal * 1.5).max(width * 1.2).clamp(16.0, 64.0);
+
+        // If screen is wide or curved, emit 3 directional lights across the screen for immersive surround ambiance
+        if (width > 6.0 || screen_curvature > 5.0)
+            && let Some(zones) = zone_colors
+        {
+            let spread = (width as f64 * 0.3).min(6.0);
+            let side_radius = (base_radius * 0.85).clamp(4.0, 48.0);
+            let side_intensity = (intensity * 0.85).clamp(0.0, 1.0);
+
+            let tune_zone =
+                |z: [u8; 3]| -> u32 { tune_color(z[0] as f32, z[1] as f32, z[2] as f32) };
+
+            // Left light
+            let left_pos = [
+                screen_at[0] - right[0] * spread + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] - right[1] * spread + normal[1] * forward_offset,
+            ];
+            let left_rgb = tune_zone(zones[0]);
+            event.lights.push(NativeColoredLight {
+                at: left_pos,
+                rgb: left_rgb,
+                radius: side_radius,
+                intensity: side_intensity,
+            });
+
+            // Center light
+            let center_pos = [
+                screen_at[0] + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + normal[1] * forward_offset,
+            ];
+            let center_rgb = pack_rgb(
+                state.current_light_rgb[0],
+                state.current_light_rgb[1],
+                state.current_light_rgb[2],
+            );
+            event.lights.push(NativeColoredLight {
+                at: center_pos,
+                rgb: center_rgb,
+                radius: base_radius,
+                intensity,
+            });
+
+            // Right light
+            let right_pos = [
+                screen_at[0] + right[0] * spread + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + right[1] * spread + normal[1] * forward_offset,
+            ];
+            let right_rgb = tune_zone(zones[2]);
+            event.lights.push(NativeColoredLight {
+                at: right_pos,
+                rgb: right_rgb,
+                radius: side_radius,
+                intensity: side_intensity,
+            });
         } else {
-            vec![(height as f64 * 0.45, 1.0)]
-        };
-
-        let light_radius = (screen_diagonal * 1.5).max(width * 1.2).clamp(24.0, 64.0);
-
-        let norm_factor = if is_tall { 2.4 } else { 1.8 };
-        let base_light_intensity = (intensity / norm_factor).clamp(0.01, 1.0);
-
-        let alpha = screen_curvature.to_radians() as f64;
-        let radius_arc = if screen_curvature > 0.5 && alpha > 0.001 {
-            (width as f64) / alpha
-        } else {
-            0.0
-        };
-
-        for (y_offset, row_weight) in rows {
-            for col in 0..n_cols {
-                let t = -0.92 + 1.84 * (col as f32 / (n_cols - 1) as f32);
-                let edge_boost = if col == 0 || col == n_cols - 1 { 1.25 } else { 1.0 };
-                let col_intensity = (base_light_intensity * row_weight * edge_boost).clamp(0.0, 1.0);
-
-                // Compute exact 3D position along the flat or curved screen
-                let (pos_x, pos_z, norm_x, norm_z) = if radius_arc > 0.0 {
-                    let phi = (t as f64) * (alpha * 0.5);
-                    let arc_x = right[0] * (radius_arc * phi.sin()) + normal[0] * (radius_arc * (1.0 - phi.cos()));
-                    let arc_z = right[1] * (radius_arc * phi.sin()) + normal[1] * (radius_arc * (1.0 - phi.cos()));
-                    let n_x = normal[0] * phi.cos() - right[0] * phi.sin();
-                    let n_z = normal[1] * phi.cos() - right[1] * phi.sin();
-                    (screen_at[0] + arc_x, screen_at[2] + arc_z, n_x, n_z)
-                } else {
-                    let half_w = (width as f64) * 0.5;
-                    (
-                        screen_at[0] + right[0] * (t as f64 * half_w),
-                        screen_at[2] + right[1] * (t as f64 * half_w),
-                        normal[0],
-                        normal[1],
-                    )
-                };
-
-                let light_pos = [
-                    pos_x + norm_x * forward_offset,
-                    screen_at[1] + y_offset,
-                    pos_z + norm_z * forward_offset,
-                ];
-
-                // Smooth color interpolation across screen zones
-                let light_rgb = if let Some(zones) = zone_colors {
-                    let (c1, c2, factor) = if t <= -0.33 {
-                        let f = ((t + 1.0) / 0.67).clamp(0.0, 1.0);
-                        (zones[0], zones[0], f)
-                    } else if t < 0.0 {
-                        let f = ((t + 0.33) / 0.33).clamp(0.0, 1.0);
-                        (zones[0], zones[1], f)
-                    } else if t <= 0.33 {
-                        let f = (t / 0.33).clamp(0.0, 1.0);
-                        (zones[1], zones[2], f)
-                    } else {
-                        (zones[2], zones[2], 1.0)
-                    };
-                    let r = c1[0] as f32 * (1.0 - factor) + c2[0] as f32 * factor;
-                    let g = c1[1] as f32 * (1.0 - factor) + c2[1] as f32 * factor;
-                    let b = c1[2] as f32 * (1.0 - factor) + c2[2] as f32 * factor;
-                    tune_color(r, g, b)
-                } else {
-                    pack_rgb(
-                        state.current_light_rgb[0],
-                        state.current_light_rgb[1],
-                        state.current_light_rgb[2],
-                    )
-                };
-
-                event.lights.push(NativeColoredLight {
-                    at: light_pos,
-                    rgb: light_rgb,
-                    radius: light_radius,
-                    intensity: col_intensity,
-                });
-            }
+            // Single center light
+            let center_pos = [
+                screen_at[0] + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + normal[1] * forward_offset,
+            ];
+            let center_rgb = pack_rgb(
+                state.current_light_rgb[0],
+                state.current_light_rgb[1],
+                state.current_light_rgb[2],
+            );
+            event.lights.push(NativeColoredLight {
+                at: center_pos,
+                rgb: center_rgb,
+                radius: base_radius,
+                intensity,
+            });
         }
     }
 
@@ -2521,11 +2977,13 @@ impl Hooks for VideoScreen {
         };
         let gui_size = [event.screen.rect[2], event.screen.rect[3]];
 
-        if let Some((handle, _)) = Self::find_hit_handle(screen, &camera, event.screen.mouse, gui_size)
-            && let Some(editing) = state.editing.as_mut() {
-                editing.active_handle = Some(handle);
-                return Flow::Cancel;
-            }
+        if let Some((handle, _)) =
+            Self::find_hit_handle(screen, &camera, event.screen.mouse, gui_size)
+            && let Some(editing) = state.editing.as_mut()
+        {
+            editing.active_handle = Some(handle);
+            return Flow::Cancel;
+        }
         Flow::Continue
     }
 
@@ -2551,7 +3009,10 @@ impl Hooks for VideoScreen {
         };
 
         if let Some((u, v)) = Self::raycast_screen_plane(screen, &camera, event.mouse, gui_size) {
-            let native_size = screen.video.and_then(|v| host.video_state(v)).and_then(|s| s.video_size);
+            let native_size = screen
+                .video
+                .and_then(|v| host.video_state(v))
+                .and_then(|s| s.video_size);
             Self::apply_drag(screen, active_handle, u, v, native_size, grid_snap);
             return Flow::Cancel;
         }
@@ -2568,9 +3029,10 @@ impl Hooks for VideoScreen {
         }
         let mut state = self.state();
         if let Some(editing) = state.editing.as_mut()
-            && editing.active_handle.take().is_some() {
-                return Flow::Cancel;
-            }
+            && editing.active_handle.take().is_some()
+        {
+            return Flow::Cancel;
+        }
         Flow::Continue
     }
 }
